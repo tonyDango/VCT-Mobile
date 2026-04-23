@@ -27,7 +27,7 @@ export async function getLiveMatches(limit = 20) {
 }
 
 export async function getMatchDetail(matchId: number) {
-  return apiGet<MatchDetailResponse>(`/match/${matchId}`);
+  return apiGet<MatchDetailResponse>(withQuery(`/match/${matchId}`, { _ts: Date.now() }));
 }
 
 export async function getEvents(status: "all" | "ongoing" | "upcoming" | "completed", limit = 30) {

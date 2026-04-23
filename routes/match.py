@@ -74,4 +74,7 @@ def vct_matches():
 @match_bp.route("/<int:match_id>")
 def match_detail(match_id: int):
     payload = get_match_detail(match_id)
-    return jsonify(to_jsonable(payload))
+    res = jsonify(to_jsonable(payload))
+    res.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    res.headers["Pragma"] = "no-cache"
+    return res

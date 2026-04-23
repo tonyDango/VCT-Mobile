@@ -1,6 +1,6 @@
-import { RouteProp, useNavigation, useRoute } from "@react-navigation/native";
+import { RouteProp, useFocusEffect, useNavigation, useRoute } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Image, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 import { MatchDetailResponse, MatchDetailTeam, MatchMapStats, PlayerStatsRow } from "../api/types";
@@ -36,6 +36,7 @@ export function MatchDetailScreen() {
   const [sortOrder, setSortOrder] = useState<"asc" | "desc">("desc");
   const [agentIconMap, setAgentIconMap] = useState<Record<string, string>>({});
   const [playerAvatarMap, setPlayerAvatarMap] = useState<Record<number, string | null>>({});
+  const hasMountedFocus = useRef(false);
 
   const detail = (data as MatchDetailResponse | null) || null;
   const mapOptions = detail ? buildMapOptions(detail) : [{ key: "all", label: "All Maps", data: undefined }];
@@ -134,6 +135,16 @@ export function MatchDetailScreen() {
       alive = false;
     };
   }, [visiblePlayerIdsKey]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!hasMountedFocus.current) {
+        hasMountedFocus.current = true;
+        return;
+      }
+      reload();
+    }, [reload])
+  );
 
   if (loading) return <LoadingState />;
   if (error) return <ErrorState message={error} onRetry={reload} />;
