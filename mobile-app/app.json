@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "VLR Mobile",
+    "slug": "vlr-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {},
+    "web": {
+      "bundler": "metro"
+    }
+  }
+}
