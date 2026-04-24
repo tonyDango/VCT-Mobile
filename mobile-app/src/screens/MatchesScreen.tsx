@@ -43,6 +43,7 @@ const REGION_OPTIONS: Array<{ value: RegionValue; label: string; icon: string }>
   [] as Array<{ value: RegionValue; label: string; icon: string }>
 );
 const DEFAULT_SELECTED_REGIONS: RegionValue[] = REGION_OPTIONS.map((r) => r.value);
+const ALL_REGIONS_COUNT = DEFAULT_SELECTED_REGIONS.length;
 const MATCHES_PAGE_SIZE = 20;
 const MATCHES_FETCH_LIMIT = 120;
 
@@ -65,7 +66,7 @@ export function MatchesScreen() {
   );
   const dropdownTop = Math.max(insets.top + 8, filterAnchor.y);
 
-  const ongoingHook = useAsyncData(() => getLiveMatches(12), []);
+  const ongoingHook = useAsyncData(() => getLiveMatches(50), []);
   const upcomingHook = useAsyncData(() => getHomeVctMatches("upcoming", MATCHES_FETCH_LIMIT, 2), []);
   const completedHook = useAsyncData(() => getHomeVctMatches("completed", MATCHES_FETCH_LIMIT, 2), []);
 
@@ -137,11 +138,16 @@ export function MatchesScreen() {
               <MatchRow
                 key={`${match.match_id || "live"}-${index}`}
                 alt={index % 2 === 1}
-                team1={match.team1}
-                team2={match.team2}
-                boText={extractBo(match.event_phase)}
-                rightTop={scoreText(match.team1, match.team2) === "-" ? "LIVE" : scoreText(match.team1, match.team2)}
-                rightBottom={formatDateTimeFromParts(match.date, match.time)}
+                team1={pickLiveTeam(match, 0)}
+                team2={pickLiveTeam(match, 1)}
+                boText={bestOfForLive(match)}
+                rightTop={
+                  scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1)) === "-"
+                    ? "LIVE"
+                    : scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1))
+                }
+                rightBottom={formatLiveDateTime(match)}
+                topVariant={scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1)) === "-" ? "default" : "score"}
                 onPress={() => {
                   if (match.match_id) navigation.navigate("MatchDetail", { matchId: match.match_id });
                 }}
@@ -382,9 +388,22 @@ function formatSeries(series?: string) {
   return text;
 }
 
-function extractBo(text?: string) {
-  const m = (text || "").toUpperCase().match(/BO\s*([1-9])/);
-  return m?.[1] ? `BO ${m[1]}` : "BO ?";
+function bestOfForLive(match: MatchListItem) {
+  const raw = match as MatchListItem & {
+    best_of?: string;
+    phase?: string;
+    series?: string;
+    event_name?: string;
+  };
+  const direct = formatSeries(raw.best_of || raw.series || undefined);
+  if (direct !== "BO ?" && direct !== (raw.best_of || raw.series || "").toUpperCase()) {
+    return direct;
+  }
+  const source = `${match.event_phase || ""} ${raw.phase || ""} ${raw.event || ""} ${raw.event_name || ""}`.toLowerCase();
+  const bo = source.match(/\bbo\s*([1-9])\b/i)?.[1];
+  if (bo) return `BO ${bo}`;
+  if (/(grand final|lower final|upper final|final)/.test(source)) return "BO 5";
+  return "BO 3";
 }
 
 function formatDateTime(iso?: string) {
@@ -398,10 +417,42 @@ function formatDateTime(iso?: string) {
   return `${month} ${day} ${hh}:${mm}`;
 }
 
-function formatDateTimeFromParts(date?: string, time?: string) {
-  const dateText = (date || "-").trim();
-  const timeText = time ? String(time).slice(0, 5) : "--:--";
-  return `${dateText} ${timeText}`;
+function parseDateTimeFromParts(date?: string, time?: string) {
+  const d = (date || "").trim();
+  if (!d) return null;
+  const t = (time || "").trim();
+  const merged = t ? new Date(`${d} ${t}`) : new Date(d);
+  if (!Number.isNaN(merged.getTime())) return merged.toISOString();
+  const normalizedTime = t ? String(t).slice(0, 5) : "00:00";
+  const retry = new Date(`${d} ${normalizedTime}`);
+  if (!Number.isNaN(retry.getTime())) return retry.toISOString();
+  return null;
+}
+
+function pickLiveTeam(match: MatchListItem, index: 0 | 1): MatchTeam {
+  const fallback = index === 0 ? match.team1 : match.team2;
+  const anyMatch = match as MatchListItem & {
+    teams?: Array<MatchTeam & { logo_url?: string | null; image_url?: string | null }>;
+  };
+  const fromArray = anyMatch.teams?.[index];
+  const src = fromArray || fallback || {};
+  const anyTeam = src as MatchTeam & { logo_url?: string | null; image_url?: string | null };
+  const logo = anyTeam.logo || anyTeam.logo_url || anyTeam.image_url || null;
+  return {
+    id: src.id,
+    name: src.name,
+    tag: src.tag ?? null,
+    score: src.score ?? null,
+    country: src.country,
+    logo,
+  };
+}
+
+function formatLiveDateTime(match: MatchListItem) {
+  const anyMatch = match as MatchListItem & { match_datetime?: string };
+  const iso = anyMatch.match_datetime || parseDateTimeFromParts(match.date, match.time);
+  if (iso) return formatDateTime(iso);
+  return "-";
 }
 
 function formatCountdown(iso?: string) {
@@ -467,19 +518,26 @@ function regionIconFor(regionName: string) {
 
 function detectRegion(eventName?: string): RegionValue | "" {
   const text = (eventName || "").toLowerCase();
+  if (text.includes("champions") || text.includes("champs")) return "champions";
+  if (text.includes("masters")) return "masters";
+  if (text.includes("emea") || text.includes("europe") || text.includes("middle east")) return "emea";
+  if (text.includes("pacific") || text.includes("apac")) return "pacific";
+  if (text.includes("china") || /\bvct\s*cn\b/.test(text) || /\bcn\b/.test(text)) return "china";
+  if (text.includes("americas") || text.includes("latam") || text.includes("latin america")) return "americas";
   if (text.includes("americas")) return "americas";
   if (text.includes("emea")) return "emea";
   if (text.includes("pacific")) return "pacific";
   if (text.includes("china")) return "china";
-  if (text.includes("masters")) return "masters";
-  if (text.includes("champions") || text.includes("champs")) return "champions";
   return "";
 }
 
 function matchesRegion(eventName: string | undefined, selectedRegions: RegionValue[]) {
   if (selectedRegions.length === 0) return false;
   const eventRegion = detectRegion(eventName);
-  return eventRegion ? selectedRegions.includes(eventRegion) : false;
+  if (!eventRegion) {
+    return selectedRegions.length >= ALL_REGIONS_COUNT;
+  }
+  return selectedRegions.includes(eventRegion);
 }
 
 const styles = StyleSheet.create({

@@ -1,9 +1,9 @@
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
-import { CompositeNavigationProp, useNavigation } from "@react-navigation/native";
+import { CompositeNavigationProp, useFocusEffect, useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Image,
@@ -16,8 +16,8 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { HomeVctMatchItem, TeamSelectorRegion } from "../api/types";
-import { getHomeVctMatches, getTeamDetail, getTeamSelector } from "../api/vlrApi";
+import { HomeVctMatchItem, MatchListItem, TeamSelectorRegion } from "../api/types";
+import { getHomeVctMatches, getLiveMatches, getTeamDetail, getTeamSelector } from "../api/vlrApi";
 import {
   HOME_IMAGE_URLS,
   HOME_REGION_ICON_URLS,
@@ -135,6 +135,102 @@ function pickOpponentTeam(match: TeamMatch | undefined, selectedTeamId?: number)
   return t2 || t1;
 }
 
+function normalizeNameKey(name?: string | null) {
+  return (name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function toTs(iso?: string) {
+  if (!iso) return null;
+  const ts = new Date(iso).getTime();
+  return Number.isFinite(ts) ? ts : null;
+}
+
+function pickNextUpcomingMatch(matches: TeamMatch[]) {
+  if (!matches.length) return undefined;
+  const now = Date.now();
+  const safe = matches.filter((m) => {
+    const ts = toTs(m.match_datetime);
+    if (ts === null) return false;
+    return ts >= now - 2 * 60 * 60 * 1000;
+  });
+  if (!safe.length) return undefined;
+  const sorted = [...safe].sort((a, b) => {
+    const ta = toTs(a.match_datetime);
+    const tb = toTs(b.match_datetime);
+    if (ta === null && tb === null) return 0;
+    if (ta === null) return 1;
+    if (tb === null) return -1;
+    return ta - tb;
+  });
+  return sorted[0];
+}
+
+function mergeDateAndTime(dateText?: string, timeText?: string) {
+  const d = (dateText || "").trim();
+  if (!d) return undefined;
+  const t = (timeText || "00:00").trim();
+  const normalizedTime = /^\d{1,2}:\d{2}$/.test(t) ? t : "00:00";
+  const candidate = new Date(`${d} ${normalizedTime}`);
+  if (Number.isNaN(candidate.getTime())) return undefined;
+  return candidate.toISOString();
+}
+
+function toTeamMatchFromLive(row: MatchListItem): TeamMatch {
+  return {
+    match_id: row.match_id,
+    phase: row.event_phase,
+    series: row.event_phase,
+    match_datetime: mergeDateAndTime(row.date, row.time),
+    team1: {
+      id: row.team1?.id,
+      name: row.team1?.name,
+      tag: row.team1?.tag,
+      score: row.team1?.score,
+      logo: row.team1?.logo || null,
+    },
+    team2: {
+      id: row.team2?.id,
+      name: row.team2?.name,
+      tag: row.team2?.tag,
+      score: row.team2?.score,
+      logo: row.team2?.logo || null,
+    },
+  };
+}
+
+function findLiveMatchForTeam(
+  rows: MatchListItem[],
+  selectedTeamId?: number | null,
+  teamName?: string,
+  teamTag?: string | null
+) {
+  if (!rows.length) return undefined;
+  const normalizedTeamName = normalizeNameKey(teamName);
+  const normalizedTeamTag = normalizeNameKey(teamTag);
+
+  for (const row of rows) {
+    if (selectedTeamId && (row.team1?.id === selectedTeamId || row.team2?.id === selectedTeamId)) {
+      return toTeamMatchFromLive(row);
+    }
+    const aliases = [
+      normalizeNameKey(row.team1?.name),
+      normalizeNameKey(row.team1?.tag || undefined),
+      normalizeNameKey(row.team2?.name),
+      normalizeNameKey(row.team2?.tag || undefined),
+    ];
+    if (
+      (normalizedTeamName && aliases.includes(normalizedTeamName)) ||
+      (normalizedTeamTag && aliases.includes(normalizedTeamTag))
+    ) {
+      return toTeamMatchFromLive(row);
+    }
+  }
+  return undefined;
+}
+
 function teamLogoUri(team?: { logo?: string | null; logo_url?: string | null; image_url?: string | null }) {
   if (!team) return null;
   const raw = team.logo || team.logo_url || team.image_url;
@@ -205,6 +301,7 @@ export function HomeScreen() {
   const [selectorVisible, setSelectorVisible] = useState(false);
   const [selectedRegion, setSelectedRegion] = useState<string>("");
   const [storageReady, setStorageReady] = useState(false);
+  const hasFocused = useRef(false);
 
   useEffect(() => {
     async function init() {
@@ -238,6 +335,7 @@ export function HomeScreen() {
     },
     [selectedTeamId]
   );
+  const liveHook = useAsyncData(() => getLiveMatches(30), []);
   const upcomingVctHook = useAsyncData(() => getHomeVctMatches("upcoming", 5, 1), []);
   const completedVctHook = useAsyncData(() => getHomeVctMatches("completed", 5, 1), []);
 
@@ -255,8 +353,21 @@ export function HomeScreen() {
   const upcoming = detail.upcoming_matches || [];
   const activeVctHook = tab === "upcoming" ? upcomingVctHook : completedVctHook;
   const vctMatches = (activeVctHook.data?.items || []) as HomeVctMatchItem[];
-  const nextMatch = upcoming[0];
-  const opponent = pickOpponentTeam(nextMatch, (info.team_id as number | undefined));
+  const teamTag = (info as { tag?: string | null }).tag;
+  const nextMatch = useMemo(() => pickNextUpcomingMatch(upcoming), [upcoming]);
+  const liveMatch = useMemo(
+    () =>
+      findLiveMatchForTeam(
+        (liveHook.data?.items || []) as MatchListItem[],
+        selectedTeamId,
+        info.name,
+        teamTag
+      ),
+    [liveHook.data, selectedTeamId, info.name, teamTag]
+  );
+  const featuredMatch = liveMatch || nextMatch;
+  const opponent = pickOpponentTeam(featuredMatch, (info.team_id as number | undefined));
+  const featuredIsLive = !!liveMatch;
   const list = vctMatches;
   const loadedTeamId = Number((info.team_id as number | undefined) || 0);
   const isSwitchingTeam =
@@ -269,6 +380,17 @@ export function HomeScreen() {
     if (found?.teams?.length) return found.teams;
     return regionOptions[0]?.teams || [];
   }, [regionOptions, selectedRegion]);
+
+  useFocusEffect(
+    useCallback(() => {
+      if (!hasFocused.current) {
+        hasFocused.current = true;
+        return;
+      }
+      liveHook.reload();
+      if (selectedTeamId) teamHook.reload();
+    }, [liveHook.reload, selectedTeamId, teamHook.reload])
+  );
 
   async function onSelectTeam(teamId: number) {
     setSelectedTeamId(teamId);
@@ -297,8 +419,8 @@ export function HomeScreen() {
         <Pressable
           style={styles.heroCard}
           onPress={() => {
-            if (!isSwitchingTeam && nextMatch?.match_id) {
-              navigation.navigate("MatchDetail", { matchId: nextMatch.match_id });
+            if (!isSwitchingTeam && featuredMatch?.match_id) {
+              navigation.navigate("MatchDetail", { matchId: featuredMatch.match_id });
             }
           }}
         >
@@ -309,7 +431,7 @@ export function HomeScreen() {
             </View>
           ) : (
             <>
-              <Text style={styles.heroBo}>{nextMatch ? inferBestOfForTeamMatch(nextMatch) : "BO -"}</Text>
+              <Text style={styles.heroBo}>{featuredMatch ? inferBestOfForTeamMatch(featuredMatch) : "BO -"}</Text>
               <View style={styles.heroTeams}>
                 <View style={styles.heroTeamItem}>
                   <LogoSquare uri={info.logo_url || HOME_IMAGE_URLS.defaultLogo} />
@@ -327,8 +449,13 @@ export function HomeScreen() {
                 </View>
               </View>
               <Text style={styles.heroTime}>
-                {selectedTeamId && nextMatch
-                  ? `${formatCountdown(nextMatch.match_datetime)} | ${formatDateTime(nextMatch.match_datetime)}`
+                {selectedTeamId && featuredMatch
+                  ? featuredIsLive
+                    ? (() => {
+                        const liveScore = scoreText(featuredMatch);
+                        return liveScore === "-" ? "LIVE | 比赛进行中" : `LIVE | ${liveScore}`;
+                      })()
+                    : `${formatCountdown(featuredMatch.match_datetime)} | ${formatDateTime(featuredMatch.match_datetime)}`
                   : selectedTeamId
                     ? "暂无下一场比赛"
                     : "请选择主队后查看赛程"}

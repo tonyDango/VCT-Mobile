@@ -186,6 +186,107 @@ def _event_match_dt_key(match_obj: Any) -> datetime:
     return datetime.combine(match_date, match_time)
 
 
+def _score_missing(score_value: Any) -> bool:
+    if not isinstance(score_value, (list, tuple)) or len(score_value) < 2:
+        return True
+    return score_value[0] is None and score_value[1] is None
+
+
+def _compact_match_snapshot(src: Any) -> dict[str, Any] | None:
+    if src is None:
+        return None
+
+    if isinstance(src, dict):
+        team1 = src.get("team1") or {}
+        team2 = src.get("team2") or {}
+        score = [team1.get("score"), team2.get("score")]
+        return {
+            "match_id": src.get("match_id"),
+            "status": src.get("status"),
+            "best_of": src.get("best_of"),
+            "date": src.get("date"),
+            "time": src.get("time"),
+            "score": score,
+            "team1": team1,
+            "team2": team2,
+        }
+
+    team1 = getattr(src, "team1", None)
+    team2 = getattr(src, "team2", None)
+    return {
+        "match_id": getattr(src, "match_id", None),
+        "status": getattr(src, "status", None),
+        "best_of": _normalize_best_of(getattr(src, "series", None), getattr(src, "event_phase", None)),
+        "date": getattr(src, "date", None),
+        "time": getattr(src, "time", None),
+        "score": [getattr(team1, "score", None), getattr(team2, "score", None)],
+        "team1": {
+            "id": getattr(team1, "id", None),
+            "name": getattr(team1, "name", None),
+            "tag": getattr(team1, "tag", None) or getattr(team1, "short", None),
+            "score": getattr(team1, "score", None),
+            "logo": _normalize_logo_url(
+                getattr(team1, "logo", None)
+                or getattr(team1, "logo_url", None)
+                or getattr(team1, "image_url", None)
+            ),
+        },
+        "team2": {
+            "id": getattr(team2, "id", None),
+            "name": getattr(team2, "name", None),
+            "tag": getattr(team2, "tag", None) or getattr(team2, "short", None),
+            "score": getattr(team2, "score", None),
+            "logo": _normalize_logo_url(
+                getattr(team2, "logo", None)
+                or getattr(team2, "logo_url", None)
+                or getattr(team2, "image_url", None)
+            ),
+        },
+    }
+
+
+def _find_match_snapshot_for_detail(match_id: int) -> dict[str, Any] | None:
+    def _scan_rows(rows: list[Any]) -> dict[str, Any] | None:
+        for row in rows:
+            row_id = row.get("match_id") if isinstance(row, dict) else getattr(row, "match_id", None)
+            if row_id == match_id:
+                return _compact_match_snapshot(row)
+        return None
+
+    try:
+        hit = _scan_rows(vlr.matches.live(limit=80) or [])
+        if hit:
+            return hit
+    except Exception:
+        pass
+
+    for status in ("completed", "upcoming"):
+        for refresh in (False, True):
+            try:
+                rows = list_vct_matches_for_home(
+                    status=status,
+                    limit=120,
+                    max_event_pages=3,
+                    refresh=refresh,
+                )
+            except Exception:
+                continue
+            hit = _scan_rows(rows)
+            if hit:
+                return hit
+
+    for page in (1, 2):
+        try:
+            rows = vlr.matches.completed(page=page, limit=100) or []
+            hit = _scan_rows(rows)
+            if hit:
+                return hit
+        except Exception:
+            continue
+
+    return None
+
+
 def _normalize_best_of(*texts: str | None) -> str | None:
     for text in texts:
         if not text:
@@ -259,6 +360,9 @@ def get_event_stages(event_id: int) -> list[Any]:
 
 def get_match_detail(match_id: int) -> dict[str, Any]:
     info = vlr.series.info(match_id=match_id)
+    info_payload = to_jsonable(info)
+    if not isinstance(info_payload, dict):
+        info_payload = {}
     series_maps = vlr.series.matches(series_id=match_id)
     total_stats = None
     map_stats: list[Any] = []
@@ -288,8 +392,79 @@ def get_match_detail(match_id: int) -> dict[str, Any]:
                 "logo_url": logo,
             }
         )
+
+    needs_fallback = (
+        _score_missing(info_payload.get("score"))
+        or len(team_rows) < 2
+        or all((str(t.get("name") or "").strip().lower() in {"", "-", "tbd"}) for t in team_rows)
+    )
+    if needs_fallback:
+        snapshot = _find_match_snapshot_for_detail(match_id)
+        if snapshot:
+            snap_score = snapshot.get("score")
+            if _score_missing(info_payload.get("score")) and not _score_missing(snap_score):
+                info_payload["score"] = [snap_score[0], snap_score[1]]
+            if not info_payload.get("best_of") and snapshot.get("best_of"):
+                info_payload["best_of"] = snapshot.get("best_of")
+            if not info_payload.get("date") and snapshot.get("date"):
+                info_payload["date"] = snapshot.get("date")
+            if not info_payload.get("time") and snapshot.get("time"):
+                info_payload["time"] = snapshot.get("time")
+
+            snap_teams = [snapshot.get("team1") or {}, snapshot.get("team2") or {}]
+            if len(team_rows) < 2:
+                team_rows = []
+                for snap in snap_teams:
+                    team_rows.append(
+                        {
+                            "id": snap.get("id"),
+                            "name": snap.get("name"),
+                            "short": snap.get("tag"),
+                            "tag": snap.get("tag"),
+                            "country": None,
+                            "score": snap.get("score"),
+                            "logo_url": _normalize_logo_url(
+                                snap.get("logo") or snap.get("logo_url") or snap.get("image_url")
+                            ),
+                        }
+                    )
+            else:
+                used = set()
+                for idx, snap in enumerate(snap_teams):
+                    target = None
+                    snap_id = snap.get("id")
+                    if snap_id is not None:
+                        for i, row in enumerate(team_rows):
+                            if i in used:
+                                continue
+                            if row.get("id") == snap_id:
+                                target = (i, row)
+                                break
+                    if target is None and idx < len(team_rows):
+                        target = (idx, team_rows[idx])
+                    if target is None:
+                        continue
+                    row_index, row = target
+                    used.add(row_index)
+
+                    row_name = str(row.get("name") or "").strip().lower()
+                    if not row.get("id") and snap.get("id") is not None:
+                        row["id"] = snap.get("id")
+                    if row_name in {"", "-", "tbd"} and snap.get("name"):
+                        row["name"] = snap.get("name")
+                    if not row.get("short") and snap.get("tag"):
+                        row["short"] = snap.get("tag")
+                    if not row.get("tag") and snap.get("tag"):
+                        row["tag"] = snap.get("tag")
+                    if row.get("score") is None and snap.get("score") is not None:
+                        row["score"] = snap.get("score")
+                    if not row.get("logo_url"):
+                        row["logo_url"] = _normalize_logo_url(
+                            snap.get("logo") or snap.get("logo_url") or snap.get("image_url")
+                        )
+
     return {
-        "info": info,
+        "info": info_payload,
         "event_image_url": _event_image_url(getattr(info, "event", "") or ""),
         "teams": team_rows,
         "total_stats": total_stats,

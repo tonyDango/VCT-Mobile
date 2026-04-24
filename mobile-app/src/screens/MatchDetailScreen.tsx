@@ -41,7 +41,7 @@ export function MatchDetailScreen() {
   const detail = (data as MatchDetailResponse | null) || null;
   const mapOptions = detail ? buildMapOptions(detail) : [{ key: "all", label: "All Maps", data: undefined }];
   const selectedMap = mapOptions.find((m) => m.key === selectedMapKey) || mapOptions[0];
-  const allTeams = ((detail?.teams || []).filter((t) => t.id) as MatchDetailTeam[]) || [];
+  const allTeams = ((detail?.teams || []) as MatchDetailTeam[]) || [];
   const currentMapTeams = selectedMap.data?.teams || null;
 
   useEffect(() => {
@@ -79,11 +79,12 @@ export function MatchDetailScreen() {
   const selectedTeam = allTeams.find((t) => t.id === selectedTeamId) || allTeams[0] || null;
   const sortedPlayers = useMemo(() => {
     const players = (selectedMap.data?.players || []) as PlayerStatsRow[];
+    const selectedTeamShort = (selectedTeam?.short || selectedTeam?.tag || "").trim();
     const byTeam = selectedTeam
       ? players.filter(
           (p) =>
             p.team_id === selectedTeam.id ||
-            (!!selectedTeam.short && p.team_short === selectedTeam.short)
+            (!!selectedTeamShort && p.team_short === selectedTeamShort)
         )
       : players;
     const list = byTeam.length ? byTeam : players;
@@ -223,8 +224,12 @@ export function MatchDetailScreen() {
             </View>
           ) : (
             <View style={styles.teamSwitcherRow}>
-              {allTeams.map((team) => (
-                <Pressable key={`switch-${team.id}`} onPress={() => setSelectedTeamId(team.id || null)} style={styles.switcherBtn}>
+              {allTeams.map((team, index) => (
+                <Pressable
+                  key={`switch-${team.id ?? team.short ?? team.tag ?? team.name ?? index}`}
+                  onPress={() => setSelectedTeamId(team.id || null)}
+                  style={styles.switcherBtn}
+                >
                   <TeamLogo team={team} size={42} round={8} />
                 </Pressable>
               ))}
@@ -358,9 +363,28 @@ function TeamLogo({
   return <View style={{ width: size, height: size, borderRadius: round, backgroundColor: "#c9c9c9" }} />;
 }
 
-function resolveTeam(fromMap: { id?: number } | undefined, teams: MatchDetailTeam[]): MatchDetailTeam | undefined {
-  if (!fromMap?.id) return undefined;
-  return teams.find((t) => t.id === fromMap.id);
+function resolveTeam(
+  fromMap: { id?: number; name?: string; short?: string } | undefined,
+  teams: MatchDetailTeam[]
+): MatchDetailTeam | undefined {
+  if (!fromMap) return undefined;
+  if (fromMap.id) {
+    const byId = teams.find((t) => t.id === fromMap.id);
+    if (byId) return byId;
+  }
+
+  const targetShort = (fromMap.short || "").trim().toLowerCase();
+  if (targetShort) {
+    const byShort = teams.find((t) => (t.short || t.tag || "").trim().toLowerCase() === targetShort);
+    if (byShort) return byShort;
+  }
+
+  const targetName = (fromMap.name || "").trim().toLowerCase();
+  if (targetName) {
+    const byName = teams.find((t) => (t.name || "").trim().toLowerCase() === targetName);
+    if (byName) return byName;
+  }
+  return undefined;
 }
 
 function normalizePlayerId(playerId?: number) {
