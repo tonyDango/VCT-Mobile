@@ -256,28 +256,33 @@ export function MatchDetailScreen() {
 
             {sortedPlayers.map((p, idx) => (
               <View key={`${p.player_id || p.name || "p"}-${idx}`} style={styles.playerRow}>
+                {(() => {
+                  const pid = normalizePlayerId(p.player_id);
+                  const hasPid = Boolean(pid);
+                  return (
                 <Pressable
-                  disabled={!normalizePlayerId(p.player_id)}
+                  disabled={!hasPid}
                   onPress={() => {
-                    const id = normalizePlayerId(p.player_id);
-                    if (id) navigation.navigate("PlayerDetail", { playerId: id });
+                    if (pid) navigation.navigate("PlayerDetail", { playerId: pid });
                   }}
                   style={({ pressed }) => [
                     styles.playerLeft,
                     styles.colPlayer,
-                    normalizePlayerId(p.player_id) && styles.playerPressable,
-                    normalizePlayerId(p.player_id) && pressed && styles.playerPressed,
+                    hasPid && styles.playerPressable,
+                    hasPid && pressed && styles.playerPressed,
                   ]}
                 >
                   <PlayerAvatar
                     playerId={p.player_id}
                     playerName={p.name}
-                    avatarUri={normalizePlayerId(p.player_id) ? playerAvatarMap[normalizePlayerId(p.player_id)!] : null}
+                    avatarUri={pid ? playerAvatarMap[pid] : null}
                   />
                   <Text style={styles.playerName} numberOfLines={1}>
                     {p.name}
                   </Text>
                 </Pressable>
+                  );
+                })()}
 
                 <AgentIcons
                   agents={selectedMap.key === "all" ? p.agents || [] : (p.agents || []).slice(0, 1)}

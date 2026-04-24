@@ -319,43 +319,43 @@ def _paginate(items: list[Any], page: int, page_size: int) -> dict[str, Any]:
 
 
 def list_completed_matches(page: int | None = 1, limit: int | None = 50) -> list[Any]:
-    data = vlr.matches.completed(page=page, limit=limit)
+    data = vlr.matches.completed(page=page, limit=limit, timeout=8)
     return sorted(data, key=_match_dt_key, reverse=True)
 
 
 def list_upcoming_matches(page: int | None = 1, limit: int | None = 50) -> list[Any]:
-    data = vlr.matches.upcoming(page=page, limit=limit)
+    data = vlr.matches.upcoming(page=page, limit=limit, timeout=8)
     return sorted(data, key=_match_dt_key)
 
 
 def list_live_matches(limit: int | None = 50) -> list[Any]:
-    return vlr.matches.live(limit=limit)
+    return vlr.matches.live(limit=limit, timeout=8)
 
 
 def list_vct_events(status: str = "all", page: int = 1, limit: int | None = 50) -> list[Any]:
-    data = vlr.events.list_events(tier="vct", status=status, page=page, limit=limit)
+    data = vlr.events.list_events(tier="vct", status=status, page=page, limit=limit, timeout=8)
     return sorted(data, key=lambda x: (x.start_date or date(1970, 1, 1), x.end_date or date(1970, 1, 1)))
 
 
 def get_event_info(event_id: int) -> Any:
-    return vlr.events.info(event_id=event_id)
+    return vlr.events.info(event_id=event_id, timeout=8)
 
 
 def get_event_matches(event_id: int, stage: str | None = None, limit: int | None = None) -> list[Any]:
-    data = vlr.events.matches(event_id=event_id, stage=stage, limit=limit)
+    data = vlr.events.matches(event_id=event_id, stage=stage, limit=limit, timeout=8)
     return sorted(data, key=_match_dt_key)
 
 
 def get_event_match_summary(event_id: int) -> Any:
-    return vlr.events.match_summary(event_id=event_id)
+    return vlr.events.match_summary(event_id=event_id, timeout=8)
 
 
 def get_event_standings(event_id: int, stage: str | None = None) -> Any:
-    return vlr.events.standings(event_id=event_id, stage=stage)
+    return vlr.events.standings(event_id=event_id, stage=stage, timeout=8)
 
 
 def get_event_stages(event_id: int) -> list[Any]:
-    return vlr.events.stages(event_id=event_id)
+    return vlr.events.stages(event_id=event_id, timeout=8)
 
 
 def get_match_detail(match_id: int) -> dict[str, Any]:

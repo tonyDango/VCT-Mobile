@@ -9,6 +9,7 @@ import {
   Image,
   Modal,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -57,6 +58,7 @@ export function MatchesScreen() {
   const [filterVisible, setFilterVisible] = useState(false);
   const [filterAnchor, setFilterAnchor] = useState({ x: 0, y: 0, width: 0, height: 0 });
   const filterBtnRef = useRef<View>(null);
+  const [refreshing, setRefreshing] = useState(false);
 
   const screenWidth = Dimensions.get("window").width;
   const dropdownWidth = Math.round(screenWidth * 0.5);
@@ -114,9 +116,23 @@ export function MatchesScreen() {
     });
   }
 
+  async function onRefresh() {
+    setRefreshing(true);
+    try {
+      setUpcomingPage(1);
+      setCompletedPage(1);
+      await Promise.all([ongoingHook.reload(), upcomingHook.reload(), completedHook.reload()]);
+    } finally {
+      setRefreshing(false);
+    }
+  }
+
   return (
     <View style={styles.safe}>
-      <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 18 }]}>
+      <ScrollView
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 18 }]}
+      >
         <View style={styles.headerRow}>
           <View style={styles.headerIconWrap}>
             <LogoSquare uri={HOME_IMAGE_URLS.topAvatar} size={38} borderRadius={10} />
