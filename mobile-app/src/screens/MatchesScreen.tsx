@@ -17,10 +17,11 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { HomeVctMatchItem, MatchListItem, MatchTeam } from "../api/types";
-import { getHomeVctMatches, getLiveMatches } from "../api/vlrApi";
+import { HomeVctMatchItem, MatchDetailResponse, MatchListItem, MatchTeam } from "../api/types";
+import { getHistoryMatches, getHomeVctMatches, getLiveMatches, getMatchDetail } from "../api/vlrApi";
 import { HOME_IMAGE_URLS, HOME_REGION_ICON_URLS } from "../config/homeConfig";
-import { useAsyncData } from "../hooks/useAsyncData";
+import { usePersistedAsyncData } from "../hooks/usePersistedAsyncData";
+import { PERSIST_KEYS } from "../bootstrap/preload";
 import { MainTabParamList, RootStackParamList } from "../navigation/types";
 
 type MatchTab = "upcoming" | "completed";
@@ -47,6 +48,7 @@ const DEFAULT_SELECTED_REGIONS: RegionValue[] = REGION_OPTIONS.map((r) => r.valu
 const ALL_REGIONS_COUNT = DEFAULT_SELECTED_REGIONS.length;
 const MATCHES_PAGE_SIZE = 20;
 const MATCHES_FETCH_LIMIT = 120;
+const MATCH_WINDOW_HOURS = 10;
 
 export function MatchesScreen() {
   const insets = useSafeAreaInsets();
@@ -68,23 +70,70 @@ export function MatchesScreen() {
   );
   const dropdownTop = Math.max(insets.top + 8, filterAnchor.y);
 
-  const ongoingHook = useAsyncData(() => getLiveMatches(50), []);
-  const upcomingHook = useAsyncData(() => getHomeVctMatches("upcoming", MATCHES_FETCH_LIMIT, 2), []);
-  const completedHook = useAsyncData(() => getHomeVctMatches("completed", MATCHES_FETCH_LIMIT, 2), []);
+  const ongoingHook = usePersistedAsyncData(PERSIST_KEYS.matchesLive, () => getLiveMatches(50), []);
+  const upcomingHook = usePersistedAsyncData(
+    PERSIST_KEYS.matchesVctUpcoming,
+    () => getHomeVctMatches("upcoming", MATCHES_FETCH_LIMIT, 2),
+    []
+  );
+  const completedHook = usePersistedAsyncData(
+    PERSIST_KEYS.matchesVctCompleted,
+    () => getHomeVctMatches("completed", MATCHES_FETCH_LIMIT, 2),
+    []
+  );
 
   const activeVctHook = tab === "upcoming" ? upcomingHook : completedHook;
+
+  const vctMatchById = useMemo(() => {
+    const map = new Map<number, HomeVctMatchItem>();
+    for (const row of (upcomingHook.data?.items || []) as HomeVctMatchItem[]) {
+      if (row.match_id) map.set(row.match_id, row);
+    }
+    for (const row of (completedHook.data?.items || []) as HomeVctMatchItem[]) {
+      if (row.match_id) map.set(row.match_id, row);
+    }
+    return map;
+  }, [upcomingHook.data, completedHook.data]);
+
+  const vctTeamLogoById = useMemo(() => {
+    const upcoming = (upcomingHook.data?.items || []) as HomeVctMatchItem[];
+    const completed = (completedHook.data?.items || []) as HomeVctMatchItem[];
+    return buildTeamLogoIndex([...upcoming, ...completed]);
+  }, [upcomingHook.data, completedHook.data]);
+
+  const ongoingDisplayPairs = useMemo(() => {
+    const liveRows = (ongoingHook.data?.items || []) as MatchListItem[];
+    return liveRows.map((live) => ({
+      live,
+      row: mergeOngoingIntoVctShape(live, vctMatchById.get(live.match_id), vctTeamLogoById),
+    }));
+  }, [ongoingHook.data, vctMatchById, vctTeamLogoById]);
+
   const filteredOngoing = useMemo(() => {
-    const rows = (ongoingHook.data?.items || []) as MatchListItem[];
-    return rows.filter((row) => matchesRegion(row.event, selectedRegions));
-  }, [ongoingHook.data, selectedRegions]);
+    return ongoingDisplayPairs.filter(({ row, live }) =>
+      matchesRegion(row.event_name || live.event, selectedRegions)
+    );
+  }, [ongoingDisplayPairs, selectedRegions]);
 
   const filteredUpcoming = useMemo(() => {
     const rows = (upcomingHook.data?.items || []) as HomeVctMatchItem[];
-    return rows.filter((row) => matchesRegion(row.event_name, selectedRegions));
+    const filtered = rows.filter((row) => matchesRegion(row.event_name, selectedRegions));
+    // Upcoming：时间越近越靠前
+    return [...filtered].sort((a, b) => {
+      const ta = a.match_datetime ? new Date(a.match_datetime).getTime() : Number.POSITIVE_INFINITY;
+      const tb = b.match_datetime ? new Date(b.match_datetime).getTime() : Number.POSITIVE_INFINITY;
+      return ta - tb;
+    });
   }, [upcomingHook.data, selectedRegions]);
   const filteredCompleted = useMemo(() => {
     const rows = (completedHook.data?.items || []) as HomeVctMatchItem[];
-    return rows.filter((row) => matchesRegion(row.event_name, selectedRegions));
+    const filtered = rows.filter((row) => matchesRegion(row.event_name, selectedRegions));
+    // Completed：最新结束的比赛排在最前面，避免“明明有但翻页才看到”
+    return [...filtered].sort((a, b) => {
+      const ta = a.match_datetime ? new Date(a.match_datetime).getTime() : 0;
+      const tb = b.match_datetime ? new Date(b.match_datetime).getTime() : 0;
+      return tb - ta;
+    });
   }, [completedHook.data, selectedRegions]);
 
   const activeRows = tab === "upcoming" ? filteredUpcoming : filteredCompleted;
@@ -116,12 +165,89 @@ export function MatchesScreen() {
     });
   }
 
+  function mergeByIdKeepingOutsideWindow(existing: HomeVctMatchItem[], fresh: HomeVctMatchItem[]) {
+    const byId = new Map<number, HomeVctMatchItem>();
+    for (const row of fresh) {
+      if (row.match_id) byId.set(row.match_id, row);
+    }
+
+    const existingIds = new Set<number>();
+    for (const row of existing) {
+      if (row.match_id) existingIds.add(row.match_id);
+    }
+
+    // 关键修复：窗口内 fresh 里新增的 match 也要插入，否则刚结束的比赛会短暂“两边都不出现”
+    const newInWindow = fresh.filter((row) => {
+      if (!row.match_id) return false;
+      if (existingIds.has(row.match_id)) return false;
+      return withinWindowIso(row.match_datetime, MATCH_WINDOW_HOURS);
+    });
+
+    const replacedExisting = existing.map((row) => {
+      if (!row.match_id) return row;
+      if (!withinWindowIso(row.match_datetime, MATCH_WINDOW_HOURS)) return row;
+      return byId.get(row.match_id) || row;
+    });
+
+    return [...newInWindow, ...replacedExisting];
+  }
+
   async function onRefresh() {
     setRefreshing(true);
     try {
       setUpcomingPage(1);
       setCompletedPage(1);
-      await Promise.all([ongoingHook.reload(), upcomingHook.reload(), completedHook.reload()]);
+
+      // 进行中比赛：全量刷新（数量本就少）
+      await ongoingHook.reload();
+
+      // Upcoming/Completed：仅刷新当前时间±10小时内的比赛
+      const [freshUpcoming, freshCompleted] = await Promise.all([
+        getHomeVctMatches("upcoming", 60, 1),
+        getHomeVctMatches("completed", 60, 1),
+      ]);
+
+      const existingUpcoming = ((upcomingHook.data?.items || []) as HomeVctMatchItem[]) || [];
+      const existingCompleted = ((completedHook.data?.items || []) as HomeVctMatchItem[]) || [];
+      const mergedUpcoming = mergeByIdKeepingOutsideWindow(
+        existingUpcoming,
+        (freshUpcoming.items || []) as HomeVctMatchItem[]
+      );
+      let mergedCompleted = mergeByIdKeepingOutsideWindow(
+        existingCompleted,
+        (freshCompleted.items || []) as HomeVctMatchItem[]
+      );
+
+      // 关键兜底：如果 /match/vct 的 completed 缺失某些「刚结束」比赛，
+      // 仅在 VCT 且时间窗口内时，用 /match/history 找 match_id，再用 /match/:id 详情补齐 BO 与队标。
+      const vctCompletedIds = new Set<number>(mergedCompleted.map((m) => m.match_id).filter(Boolean) as number[]);
+      const history = await getHistoryMatches(160);
+      const rawRows = (history.items || []) as MatchListItem[];
+      const vctCandidates = rawRows
+        .map((r) => ({ row: r, iso: parseDateTimeFromParts(r.date, r.time) }))
+        .filter(
+          ({ row, iso }) =>
+            isLikelyVctEvent(row.event) && withinWindowIso(iso || undefined, MATCH_WINDOW_HOURS)
+        );
+
+      const missing = vctCandidates
+        .map(({ row, iso }) => ({ matchId: row.match_id, iso: iso || undefined }))
+        .filter(
+          (x) => Number.isFinite(x.matchId) && x.matchId > 0 && !vctCompletedIds.has(x.matchId)
+        );
+
+      if (missing.length) {
+        const enriched = await fetchMissingCompletedAsVctItems(missing.slice(0, 6));
+        if (enriched.length) {
+          mergedCompleted = [...enriched, ...mergedCompleted];
+        }
+      }
+
+      // 写回页面状态 + 本地落盘（避免触发全量 reload）
+      await Promise.all([
+        upcomingHook.update({ ...freshUpcoming, items: mergedUpcoming }, true),
+        completedHook.update({ ...freshCompleted, items: mergedCompleted }, true),
+      ]);
     } finally {
       setRefreshing(false);
     }
@@ -150,25 +276,25 @@ export function MatchesScreen() {
           ) : filteredOngoing.length === 0 ? (
             <CardText text="暂无正在进行的比赛" />
           ) : (
-            filteredOngoing.map((match, index) => (
-              <MatchRow
-                key={`${match.match_id || "live"}-${index}`}
-                alt={index % 2 === 1}
-                team1={pickLiveTeam(match, 0)}
-                team2={pickLiveTeam(match, 1)}
-                boText={bestOfForLive(match)}
-                rightTop={
-                  scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1)) === "-"
-                    ? "LIVE"
-                    : scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1))
-                }
-                rightBottom={formatLiveDateTime(match)}
-                topVariant={scoreText(pickLiveTeam(match, 0), pickLiveTeam(match, 1)) === "-" ? "default" : "score"}
-                onPress={() => {
-                  if (match.match_id) navigation.navigate("MatchDetail", { matchId: match.match_id });
-                }}
-              />
-            ))
+            filteredOngoing.map(({ row, live }, index) => {
+              const sc = scoreText(row.team1, row.team2);
+              const boText = row.best_of ? formatSeries(row.best_of) : bestOfForLive(live);
+              return (
+                <MatchRow
+                  key={`${row.match_id || "live"}-${index}`}
+                  alt={index % 2 === 1}
+                  team1={row.team1}
+                  team2={row.team2}
+                  boText={boText}
+                  rightTop={sc === "-" ? "LIVE" : sc}
+                  rightBottom={formatDateTime(row.match_datetime)}
+                  topVariant={sc === "-" ? "default" : "score"}
+                  onPress={() => {
+                    if (row.match_id) navigation.navigate("MatchDetail", { matchId: row.match_id });
+                  }}
+                />
+              );
+            })
           )}
         </View>
 
@@ -436,13 +562,146 @@ function formatDateTime(iso?: string) {
 function parseDateTimeFromParts(date?: string, time?: string) {
   const d = (date || "").trim();
   if (!d) return null;
+  // 期望 d 为 YYYY-MM-DD
+  const dm = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!dm) return null;
+  const year = Number(dm[1]);
+  const month = Number(dm[2]);
+  const day = Number(dm[3]);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+
   const t = (time || "").trim();
-  const merged = t ? new Date(`${d} ${t}`) : new Date(d);
-  if (!Number.isNaN(merged.getTime())) return merged.toISOString();
-  const normalizedTime = t ? String(t).slice(0, 5) : "00:00";
-  const retry = new Date(`${d} ${normalizedTime}`);
-  if (!Number.isNaN(retry.getTime())) return retry.toISOString();
-  return null;
+  let hh = 0;
+  let mm = 0;
+  if (t) {
+    // 支持：`4:00 PM` / `04:00 PM` / `16:00` / `4:00`
+    const m12 = t.match(/^(\d{1,2}):(\d{2})\s*([AP]M)$/i);
+    const m24 = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (m12) {
+      hh = Number(m12[1]);
+      mm = Number(m12[2]);
+      const ap = m12[3].toUpperCase();
+      if (ap === "PM" && hh < 12) hh += 12;
+      if (ap === "AM" && hh === 12) hh = 0;
+    } else if (m24) {
+      hh = Number(m24[1]);
+      mm = Number(m24[2]);
+    } else {
+      // 最后兜底：仅取前 5 位尝试 24h
+      const head = t.slice(0, 5);
+      const m = head.match(/^(\d{1,2}):(\d{2})$/);
+      if (m) {
+        hh = Number(m[1]);
+        mm = Number(m[2]);
+      } else {
+        return null;
+      }
+    }
+  }
+
+  if (![year, month, day, hh, mm].every((n) => Number.isFinite(n))) return null;
+  if (month < 1 || month > 12) return null;
+  if (day < 1 || day > 31) return null;
+  if (hh < 0 || hh > 23) return null;
+  if (mm < 0 || mm > 59) return null;
+
+  // 用本地时区构造，保证跨平台解析一致
+  const dt = new Date(year, month - 1, day, hh, mm, 0, 0);
+  const ts = dt.getTime();
+  if (!Number.isFinite(ts)) return null;
+  return dt.toISOString();
+}
+
+function withinWindowIso(iso?: string, hours = 10) {
+  if (!iso) return false;
+  const ts = new Date(iso).getTime();
+  if (!Number.isFinite(ts)) return false;
+  const diff = Math.abs(ts - Date.now());
+  return diff <= hours * 60 * 60 * 1000;
+}
+
+function isLikelyVctEvent(eventName?: string) {
+  const text = (eventName || "").toLowerCase();
+  // 避免把 Challengers / Academy / GC / 乱七八糟的联赛塞进主列表
+  if (!text.includes("vct")) return false;
+  if (text.includes("challengers")) return false;
+  if (text.includes("academy")) return false;
+  if (text.includes("game changers") || /\bgc\b/.test(text)) return false;
+  return true;
+}
+
+const MATCH_DETAIL_CACHE = new Map<number, MatchDetailResponse>();
+const MATCH_DETAIL_INFLIGHT = new Map<number, Promise<MatchDetailResponse | null>>();
+
+async function loadMatchDetailCached(matchId: number) {
+  const hit = MATCH_DETAIL_CACHE.get(matchId);
+  if (hit) return hit;
+  const inflight = MATCH_DETAIL_INFLIGHT.get(matchId);
+  if (inflight) return inflight;
+  const p = getMatchDetail(matchId)
+    .then((d) => {
+      if (d) MATCH_DETAIL_CACHE.set(matchId, d as MatchDetailResponse);
+      MATCH_DETAIL_INFLIGHT.delete(matchId);
+      return (d as MatchDetailResponse) || null;
+    })
+    .catch(() => {
+      MATCH_DETAIL_INFLIGHT.delete(matchId);
+      return null;
+    });
+  MATCH_DETAIL_INFLIGHT.set(matchId, p);
+  return p;
+}
+
+function toHomeVctFromDetail(detail: MatchDetailResponse, fallbackIso?: string): HomeVctMatchItem | null {
+  const match_id = detail?.info?.match_id;
+  if (!Number.isFinite(match_id) || match_id <= 0) return null;
+  const match_datetime = parseDateTimeFromParts(detail.info?.date, detail.info?.time) || fallbackIso || undefined;
+  return {
+    match_id,
+    status: "completed",
+    event_name: detail.info?.event,
+    phase: detail.info?.event_phase,
+    match_datetime,
+    best_of: detail.info?.best_of ?? null,
+    team1: {
+      id: detail.teams?.[0]?.id,
+      name: detail.teams?.[0]?.name,
+      tag: detail.teams?.[0]?.tag ?? null,
+      score: detail.teams?.[0]?.score ?? null,
+      logo: detail.teams?.[0]?.logo_url ?? null,
+    },
+    team2: {
+      id: detail.teams?.[1]?.id,
+      name: detail.teams?.[1]?.name,
+      tag: detail.teams?.[1]?.tag ?? null,
+      score: detail.teams?.[1]?.score ?? null,
+      logo: detail.teams?.[1]?.logo_url ?? null,
+    },
+  };
+}
+
+async function fetchMissingCompletedAsVctItems(missing: Array<{ matchId: number; iso?: string }>) {
+  const dedup = new Map<number, string | undefined>();
+  for (const m of missing) {
+    if (!Number.isFinite(m.matchId) || m.matchId <= 0) continue;
+    if (!dedup.has(m.matchId)) dedup.set(m.matchId, m.iso);
+  }
+  const ids = Array.from(dedup.keys());
+  if (!ids.length) return [] as HomeVctMatchItem[];
+  const details = await Promise.all(ids.map((id) => loadMatchDetailCached(id)));
+  const out: HomeVctMatchItem[] = [];
+  for (let i = 0; i < details.length; i++) {
+    const d = details[i];
+    if (!d) continue;
+    if (!isLikelyVctEvent(d.info?.event)) continue;
+    const fallbackIso = dedup.get(ids[i]!) || undefined;
+    const item = toHomeVctFromDetail(d, fallbackIso);
+    if (!item) continue;
+    // 只补窗口内，避免污染
+    if (!withinWindowIso(item.match_datetime, MATCH_WINDOW_HOURS)) continue;
+    out.push(item);
+  }
+  return out;
 }
 
 function pickLiveTeam(match: MatchListItem, index: 0 | 1): MatchTeam {
@@ -498,6 +757,81 @@ function teamLogo(team?: MatchTeam) {
   if (!url) return null;
   if (url.startsWith("//")) return `https:${url}`;
   return url;
+}
+
+/** 与 /match/vct 列表一致：从已加载的 VCT 赛程里收集队标，供 live 行按 team_id 回填。 */
+function buildTeamLogoIndex(rows: HomeVctMatchItem[]): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const row of rows) {
+    for (const side of [row.team1, row.team2]) {
+      if (!side?.id) continue;
+      const u = teamLogo(side);
+      if (u) map.set(side.id, u);
+    }
+  }
+  return map;
+}
+
+function mergeOngoingSide(
+  vctSide: MatchTeam | undefined,
+  liveSide: MatchTeam,
+  logoByTeamId: Map<number, string>
+): MatchTeam {
+  const id = vctSide?.id ?? liveSide.id;
+  const fromIndex = typeof id === "number" ? logoByTeamId.get(id) : undefined;
+  const resolvedLogo =
+    teamLogo(vctSide) || teamLogo(liveSide) || fromIndex || null;
+  return {
+    ...liveSide,
+    ...vctSide,
+    id,
+    name: vctSide?.name || liveSide.name,
+    tag: vctSide?.tag ?? liveSide.tag ?? null,
+    score: liveSide.score ?? vctSide?.score ?? null,
+    logo: resolvedLogo ?? (vctSide as MatchTeam | undefined)?.logo ?? liveSide.logo ?? null,
+  };
+}
+
+/** 按 team_id 对齐 VCT 的 team1/team2 到 live 的左右边，避免两接口队伍顺序相反时队名/队标错位。 */
+function alignVctSidesToLive(
+  live: MatchListItem,
+  vct: HomeVctMatchItem | undefined
+): { vctForLive1?: MatchTeam; vctForLive2?: MatchTeam } {
+  if (!vct) return {};
+  const l1 = pickLiveTeam(live, 0);
+  const l2 = pickLiveTeam(live, 1);
+  const a = vct.team1;
+  const b = vct.team2;
+  const l1id = l1?.id;
+  const l2id = l2?.id;
+  if (l1id != null && a?.id === l1id) return { vctForLive1: a, vctForLive2: b };
+  if (l1id != null && b?.id === l1id) return { vctForLive1: b, vctForLive2: a };
+  return { vctForLive1: a, vctForLive2: b };
+}
+
+/** 将 live 与 vct 同源行合并为与下方 Upcoming/Completed 相同的 HomeVctMatchItem 形态，便于复用 MatchRow。 */
+function mergeOngoingIntoVctShape(
+  live: MatchListItem,
+  vct: HomeVctMatchItem | undefined,
+  logoByTeamId: Map<number, string>
+): HomeVctMatchItem {
+  const lt1 = pickLiveTeam(live, 0);
+  const lt2 = pickLiveTeam(live, 1);
+  const { vctForLive1, vctForLive2 } = alignVctSidesToLive(live, vct);
+  const team1 = mergeOngoingSide(vctForLive1, lt1, logoByTeamId);
+  const team2 = mergeOngoingSide(vctForLive2, lt2, logoByTeamId);
+  const matchDatetime =
+    vct?.match_datetime || parseDateTimeFromParts(live.date, live.time) || undefined;
+  return {
+    match_id: live.match_id,
+    status: "upcoming",
+    event_name: vct?.event_name ?? live.event,
+    phase: vct?.phase ?? live.event_phase,
+    match_datetime: matchDatetime,
+    best_of: vct?.best_of ?? null,
+    team1,
+    team2,
+  };
 }
 
 function normalizeRegionValue(value: string): RegionValue | null {

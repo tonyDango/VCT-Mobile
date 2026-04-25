@@ -1,4 +1,5 @@
 export type RootStackParamList = {
+  Bootstrap: undefined;
   MainTabs: undefined;
   Search: undefined;
   MatchDetail: { matchId: number };

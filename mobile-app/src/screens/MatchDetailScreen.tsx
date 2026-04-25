@@ -24,6 +24,57 @@ const COL = {
 const MATCH_PLAYER_AVATAR_CACHE: Record<number, string | null> = {};
 const MATCH_PLAYER_AVATAR_INFLIGHT: Record<number, Promise<string | null>> = {};
 
+/** 总览/上游里常见的队名缩写与详情 `teams` 不一致时的等价写法（小写无空格 key） */
+const TEAM_SHORT_CANONICAL: Record<string, string> = {
+  mib: "mibr",
+  mibr: "mibr",
+  skt: "t1",
+  skt1: "t1",
+  sktt1: "t1",
+  sktelecomt1: "t1",
+  t1: "t1",
+};
+
+function normalizeTeamToken(raw?: string | null) {
+  return (raw || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function canonicalTeamShort(raw?: string | null) {
+  const t = normalizeTeamToken(raw);
+  if (!t) return "";
+  return TEAM_SHORT_CANONICAL[t] || t;
+}
+
+function teamMatchTokens(team: MatchDetailTeam): string[] {
+  const raw = [team.short, team.tag, team.name];
+  const set = new Set<string>();
+  for (const part of raw) {
+    const n = normalizeTeamToken(part);
+    if (n) set.add(n);
+    const c = canonicalTeamShort(part);
+    if (c) set.add(c);
+  }
+  return [...set];
+}
+
+/** All map 等聚合里 team_id / team_short 可能与详情略不一致；绝不因筛空而回退显示十人。 */
+function playerBelongsToTeam(p: PlayerStatsRow, team: MatchDetailTeam): boolean {
+  const pid = typeof p.team_id === "number" ? p.team_id : Number(p.team_id);
+  if (Number.isFinite(pid) && typeof team.id === "number" && team.id > 0 && pid === team.id) {
+    return true;
+  }
+  const pCanon = canonicalTeamShort(p.team_short);
+  if (!pCanon) return false;
+  for (const tok of teamMatchTokens(team)) {
+    const tCanon = canonicalTeamShort(tok) || tok;
+    if (tCanon && tCanon === pCanon) return true;
+  }
+  return false;
+}
+
 export function MatchDetailScreen() {
   const route = useRoute<MatchDetailRoute>();
   const navigation = useNavigation<MatchDetailNavigation>();
@@ -79,16 +130,11 @@ export function MatchDetailScreen() {
   const selectedTeam = allTeams.find((t) => t.id === selectedTeamId) || allTeams[0] || null;
   const sortedPlayers = useMemo(() => {
     const players = (selectedMap.data?.players || []) as PlayerStatsRow[];
-    const selectedTeamShort = (selectedTeam?.short || selectedTeam?.tag || "").trim();
-    const byTeam = selectedTeam
-      ? players.filter(
-          (p) =>
-            p.team_id === selectedTeam.id ||
-            (!!selectedTeamShort && p.team_short === selectedTeamShort)
-        )
-      : players;
-    const list = byTeam.length ? byTeam : players;
-    return sortPlayers(list, sortKey, sortOrder);
+    if (!selectedTeam) {
+      return sortPlayers(players, sortKey, sortOrder);
+    }
+    const filtered = players.filter((p) => playerBelongsToTeam(p, selectedTeam));
+    return sortPlayers(filtered, sortKey, sortOrder);
   }, [selectedMap, selectedTeam, sortKey, sortOrder]);
   const visiblePlayerIds = useMemo(() => {
     const ids: number[] = [];
@@ -457,7 +503,7 @@ function formatTopTime(date?: string, time?: string) {
 
 function splitPhaseLines(eventPhase?: string, statusNote?: string): [string, string?] {
   const phase = (eventPhase || "").trim();
-  const note = (statusNote || "").trim();
+  const note = normalizeStatusNoteCountdown((statusNote || "").trim());
   const ignored = /^(completed|upcoming|live|in progress|finished|ongoing|final)$/i;
 
   if (phase && note && !ignored.test(note) && phase.toLowerCase() !== note.toLowerCase()) {
@@ -470,6 +516,43 @@ function splitPhaseLines(eventPhase?: string, statusNote?: string): [string, str
   }
 
   return [phase || "-"];
+}
+
+function normalizeStatusNoteCountdown(note: string) {
+  const text = (note || "").trim();
+  if (!text) return "";
+  // 常见：`5h 20m` / `5 h 20 m` / `20m`
+  const hm = text.match(/^\s*(\d+)\s*h\s*(\d+)\s*m\s*$/i);
+  if (hm) {
+    const hours = Number(hm[1]);
+    const minutes = Number(hm[2]);
+    if (Number.isFinite(hours) && Number.isFinite(minutes)) {
+      const totalHours = hours + Math.floor(minutes / 60);
+      const days = Math.floor(totalHours / 24);
+      const hh = totalHours % 24;
+      return `${days}d ${hh}h`;
+    }
+  }
+  const hOnly = text.match(/^\s*(\d+)\s*h\s*$/i);
+  if (hOnly) {
+    const hours = Number(hOnly[1]);
+    if (Number.isFinite(hours)) {
+      const days = Math.floor(hours / 24);
+      const hh = hours % 24;
+      return `${days}d ${hh}h`;
+    }
+  }
+  const mOnly = text.match(/^\s*(\d+)\s*m\s*$/i);
+  if (mOnly) {
+    const minutes = Number(mOnly[1]);
+    if (Number.isFinite(minutes)) {
+      const totalHours = Math.floor(minutes / 60);
+      const days = Math.floor(totalHours / 24);
+      const hh = totalHours % 24;
+      return `${days}d ${hh}h`;
+    }
+  }
+  return text;
 }
 
 function abbr(team?: MatchDetailTeam) {

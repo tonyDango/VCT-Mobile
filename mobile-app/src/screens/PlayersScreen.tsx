@@ -2,14 +2,27 @@ import { Ionicons } from "@expo/vector-icons";
 import { BottomTabNavigationProp } from "@react-navigation/bottom-tabs";
 import { CompositeNavigationProp, useNavigation } from "@react-navigation/native";
 import { NativeStackNavigationProp } from "@react-navigation/native-stack";
-import { useEffect, useMemo, useState } from "react";
-import { ActivityIndicator, FlatList, Image, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  ActivityIndicator,
+  FlatList,
+  Image,
+  Pressable,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { PlayerDirectoryItem, TeamSelectorRegion } from "../api/types";
-import { getPlayerBasic, getPlayers, getTeamSelector } from "../api/vlrApi";
+import { getPlayerBasic, getTeamSelector } from "../api/vlrApi";
 import { HOME_IMAGE_URLS, HOME_REGION_ICON_URLS } from "../config/homeConfig";
-import { useAsyncData } from "../hooks/useAsyncData";
+import { usePersistedAsyncData } from "../hooks/usePersistedAsyncData";
+import { PERSIST_KEYS } from "../bootstrap/preload";
+import { loadPersisted, savePersisted } from "../storage/persist";
+import { buildRosterCacheKey, fetchPlayersFromRegionRosters, regionTeamsFromSelector } from "../players/rosters";
 import { MainTabParamList, RootStackParamList } from "../navigation/types";
 
 type RegionValue = "americas" | "emea" | "pacific" | "china";
@@ -28,42 +41,160 @@ const REGION_OPTIONS: Array<{ value: RegionValue; icon: string }> = [
 const PLAYER_AVATAR_CACHE: Record<number, string | null> = {};
 const PLAYER_AVATAR_INFLIGHT: Record<number, Promise<string | null>> = {};
 
+/** 各赛区合并名单（内存缓存，避免离开页面再返回时重复打满队 roster 请求） */
+const ROSTER_LIST_TTL_MS = 15 * 60 * 1000;
+const rosterListCache = new Map<string, { savedAt: number; players: PlayerDirectoryItem[] }>();
+
+function clonePlayerList(players: PlayerDirectoryItem[]) {
+  return players.map((p) => ({
+    ...p,
+    current_teams: [...(p.current_teams || [])],
+    history_teams: [...(p.history_teams || [])],
+  }));
+}
+
+function getCachedRosterList(key: string): PlayerDirectoryItem[] | null {
+  if (!key) return null;
+  const hit = rosterListCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.savedAt > ROSTER_LIST_TTL_MS) {
+    rosterListCache.delete(key);
+    return null;
+  }
+  return clonePlayerList(hit.players);
+}
+
+function setCachedRosterList(key: string, players: PlayerDirectoryItem[]) {
+  if (!key) return;
+  rosterListCache.set(key, { savedAt: Date.now(), players: clonePlayerList(players) });
+}
+
+function invalidateRosterListCache(key: string) {
+  if (key) rosterListCache.delete(key);
+}
+
 export function PlayersScreen() {
   const insets = useSafeAreaInsets();
   const navigation = useNavigation<PlayerNav>();
   const [selectedRegion, setSelectedRegion] = useState<RegionValue>("americas");
   const [query, setQuery] = useState("");
   const [avatarMap, setAvatarMap] = useState<Record<number, string | null>>({});
-  const playersHook = useAsyncData(() => getPlayers("active", 240), []);
-  const teamSelectorHook = useAsyncData(() => getTeamSelector(3), []);
+  const teamSelectorHook = usePersistedAsyncData(PERSIST_KEYS.playersTeamSelector, () => getTeamSelector(4), []);
+  const [refreshing, setRefreshing] = useState(false);
 
-  const teamRegionMap = useMemo(() => {
-    const map: Record<string, RegionValue> = {};
-    const rows = (teamSelectorHook.data?.items || []) as TeamSelectorRegion[];
-    for (const row of rows) {
-      const region = normalizeSelectorRegion(row.region);
-      if (!region) continue;
-      for (const team of row.teams || []) {
-        const aliases = [team.name, team.tag].filter(Boolean) as string[];
-        for (const alias of aliases) {
-          map[normalizeNameKey(alias)] = region;
+  useEffect(() => {
+    let cancelled = false;
+    async function seedAvatars() {
+      const hit = await loadPersisted<Record<number, string | null>>("persist:players:avatars:v1");
+      if (cancelled) return;
+      if (hit?.data) {
+        for (const [k, v] of Object.entries(hit.data)) {
+          const id = Number(k);
+          if (!Number.isFinite(id) || id <= 0) continue;
+          if (PLAYER_AVATAR_CACHE[id] === undefined) {
+            PLAYER_AVATAR_CACHE[id] = v ?? null;
+          }
         }
+        setAvatarMap((prev) => ({ ...hit.data, ...prev }));
       }
     }
-    return map;
-  }, [teamSelectorHook.data]);
+    seedAvatars();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const regionTeams = useMemo(() => {
+    return regionTeamsFromSelector((teamSelectorHook.data?.items || []) as TeamSelectorRegion[], selectedRegion);
+  }, [teamSelectorHook.data, selectedRegion]);
+
+  const rosterCacheKey = useMemo(() => buildRosterCacheKey(selectedRegion, regionTeams), [selectedRegion, regionTeams]);
+
+  const [rosterData, setRosterData] = useState<PlayerDirectoryItem[] | null>(null);
+  const [rosterLoading, setRosterLoading] = useState(true);
+  const [rosterError, setRosterError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!rosterCacheKey || !regionTeams.length) {
+      setRosterData(regionTeams.length === 0 && teamSelectorHook.data ? [] : null);
+      setRosterLoading(false);
+      setRosterError(null);
+      return;
+    }
+
+    const cached = getCachedRosterList(rosterCacheKey);
+    if (cached) {
+      setRosterData(cached);
+      setRosterLoading(false);
+      setRosterError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setRosterLoading(true);
+    setRosterError(null);
+
+    // 先读本地持久化（非内存缓存），再后台刷新写回
+    loadPersisted<PlayerDirectoryItem[]>(`persist:players:roster:${rosterCacheKey}:v1`)
+      .then((hit) => {
+        if (cancelled) return;
+        if (hit?.data?.length) {
+          setCachedRosterList(rosterCacheKey, hit.data);
+          setRosterData(hit.data);
+          setRosterLoading(false);
+        }
+      })
+      .finally(() => {
+        // 无论是否命中，都刷新一次最新名单
+        fetchPlayersFromRegionRosters(regionTeams)
+      .then((list) => {
+        if (cancelled) return;
+        setCachedRosterList(rosterCacheKey, list);
+        setRosterData(list);
+        savePersisted(`persist:players:roster:${rosterCacheKey}:v1`, list, 1);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setRosterError(err instanceof Error ? err.message : "请求失败");
+        setRosterData(null);
+      })
+      .finally(() => {
+        if (!cancelled) setRosterLoading(false);
+      });
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [rosterCacheKey, regionTeams, teamSelectorHook.data]);
+
+  const reloadRosters = useCallback(() => {
+    invalidateRosterListCache(rosterCacheKey);
+    if (!rosterCacheKey || !regionTeams.length) return;
+    setRosterLoading(true);
+    setRosterError(null);
+    fetchPlayersFromRegionRosters(regionTeams)
+      .then((list) => {
+        setCachedRosterList(rosterCacheKey, list);
+        setRosterData(list);
+        savePersisted(`persist:players:roster:${rosterCacheKey}:v1`, list, 1);
+      })
+      .catch((err) => {
+        setRosterError(err instanceof Error ? err.message : "请求失败");
+        setRosterData(null);
+      })
+      .finally(() => setRosterLoading(false));
+  }, [rosterCacheKey, regionTeams]);
 
   const players = useMemo(() => {
-    const list = (playersHook.data?.items || []) as PlayerDirectoryItem[];
+    const list = (rosterData || []) as PlayerDirectoryItem[];
     const keyword = query.trim().toLowerCase();
+    if (!keyword) return list;
     return list.filter((item) => {
-      const region = detectPlayerRegion(item, teamRegionMap);
-      if (region !== selectedRegion) return false;
-      if (!keyword) return true;
       const src = `${item.ign || ""} ${item.real_name || ""} ${item.current_teams?.join(" ") || ""}`.toLowerCase();
       return src.includes(keyword);
     });
-  }, [playersHook.data, selectedRegion, query, teamRegionMap]);
+  }, [rosterData, query]);
 
   useEffect(() => {
     const ids = players.map((p) => p.player_id).filter((id): id is number => Number.isFinite(id));
@@ -89,10 +220,28 @@ export function PlayersScreen() {
         if (!changed) return prev;
         return { ...prev, ...next };
       });
+
+      // 持久化：下次进入 Players 直接秒出头像
+      const toSave: Record<number, string | null> = {};
+      for (const id of ids) {
+        toSave[id] = PLAYER_AVATAR_CACHE[id] ?? null;
+      }
+      const existing = (await loadPersisted<Record<number, string | null>>("persist:players:avatars:v1"))?.data || {};
+      savePersisted("persist:players:avatars:v1", { ...existing, ...toSave }, 1);
     }
 
     loadAvatars();
   }, [players]);
+
+  async function onRefresh() {
+    setRefreshing(true);
+    try {
+      await teamSelectorHook.reload();
+      reloadRosters();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <View style={styles.safe}>
@@ -125,23 +274,40 @@ export function PlayersScreen() {
           ))}
         </View>
 
-        {playersHook.loading && !playersHook.data ? (
+        {teamSelectorHook.loading && !teamSelectorHook.data ? (
           <View style={styles.stateWrap}>
             <ActivityIndicator size="small" color="#111827" />
-            <Text style={styles.stateText}>正在加载选手...</Text>
+            <Text style={styles.stateText}>正在加载赛区队伍...</Text>
           </View>
-        ) : playersHook.error ? (
+        ) : teamSelectorHook.error ? (
           <View style={styles.stateWrap}>
-            <Text style={styles.stateText}>选手列表加载失败</Text>
-            <Pressable style={styles.retryBtn} onPress={playersHook.reload}>
+            <Text style={styles.stateText}>赛区队伍加载失败</Text>
+            <Pressable style={styles.retryBtn} onPress={teamSelectorHook.reload}>
               <Text style={styles.retryText}>重试</Text>
             </Pressable>
+          </View>
+        ) : rosterLoading ? (
+          <View style={styles.stateWrap}>
+            <ActivityIndicator size="small" color="#111827" />
+            <Text style={styles.stateText}>正在加载各队名单...</Text>
+          </View>
+        ) : rosterError ? (
+          <View style={styles.stateWrap}>
+            <Text style={styles.stateText}>选手名单加载失败</Text>
+            <Pressable style={styles.retryBtn} onPress={reloadRosters}>
+              <Text style={styles.retryText}>重试</Text>
+            </Pressable>
+          </View>
+        ) : regionTeams.length === 0 ? (
+          <View style={styles.stateWrap}>
+            <Text style={styles.stateText}>该赛区暂无队伍数据，请稍后重试</Text>
           </View>
         ) : (
           <FlatList
             data={players}
             style={styles.list}
             contentContainerStyle={styles.listContent}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
             keyExtractor={(item) => String(item.player_id)}
             numColumns={3}
             columnWrapperStyle={styles.gridRow}
@@ -180,76 +346,6 @@ export function PlayersScreen() {
       </View>
     </View>
   );
-}
-
-function detectPlayerRegion(player: PlayerDirectoryItem, teamRegionMap: Record<string, RegionValue>): RegionValue | "" {
-  for (const teamName of player.current_teams || []) {
-    const region = teamRegionMap[normalizeNameKey(teamName)];
-    if (region) return region;
-  }
-
-  const country = (player.country || "").toLowerCase();
-  if (!country) return "";
-  if (country.includes("china")) return "china";
-
-  const pacificWords = [
-    "korea",
-    "south korea",
-    "japan",
-    "thailand",
-    "indonesia",
-    "philippines",
-    "singapore",
-    "malaysia",
-    "vietnam",
-    "india",
-    "australia",
-    "new zealand",
-    "taiwan",
-    "hong kong",
-  ];
-  if (pacificWords.some((k) => country.includes(k))) return "pacific";
-
-  const americasWords = [
-    "united states",
-    "usa",
-    "canada",
-    "brazil",
-    "mexico",
-    "argentina",
-    "chile",
-    "colombia",
-    "peru",
-    "uruguay",
-    "ecuador",
-    "bolivia",
-    "paraguay",
-    "venezuela",
-    "costa rica",
-    "dominican",
-    "guatemala",
-    "honduras",
-    "panama",
-  ];
-  if (americasWords.some((k) => country.includes(k))) return "americas";
-
-  return "emea";
-}
-
-function normalizeSelectorRegion(region?: string): RegionValue | "" {
-  const src = (region || "").trim().toLowerCase();
-  if (src.includes("china")) return "china";
-  if (src.includes("pacific")) return "pacific";
-  if (src.includes("americas")) return "americas";
-  if (src.includes("emea")) return "emea";
-  return "";
-}
-
-function normalizeNameKey(name?: string) {
-  return (name || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
 }
 
 async function loadPlayerAvatarCached(playerId: number): Promise<string | null> {

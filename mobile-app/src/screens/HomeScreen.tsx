@@ -9,6 +9,7 @@ import {
   Image,
   Modal,
   Pressable,
+  RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
@@ -16,8 +17,8 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { HomeVctMatchItem, MatchListItem, TeamSelectorRegion } from "../api/types";
-import { getHomeVctMatches, getLiveMatches, getTeamDetail, getTeamSelector } from "../api/vlrApi";
+import { HomeVctMatchItem, MatchListItem, TeamSelectorRegion, TeamSelectorTeam } from "../api/types";
+import { getHomeVctMatches, getLiveMatches, getTeamSelector } from "../api/vlrApi";
 import {
   HOME_IMAGE_URLS,
   HOME_REGION_ICON_URLS,
@@ -25,7 +26,8 @@ import {
   HOME_TEAM_ABBR_MAP,
 } from "../config/homeConfig";
 import { ErrorState, LoadingState } from "../components/Common";
-import { useAsyncData } from "../hooks/useAsyncData";
+import { usePersistedAsyncData } from "../hooks/usePersistedAsyncData";
+import { PERSIST_KEYS } from "../bootstrap/preload";
 import { MainTabParamList, RootStackParamList } from "../navigation/types";
 
 type HomeTab = "upcoming" | "completed";
@@ -50,28 +52,6 @@ type TeamMatch = {
   team1?: TeamSide;
   team2?: TeamSide;
 };
-
-type TeamInfo = {
-  team_id?: number;
-  name?: string;
-  tag?: string | null;
-  logo_url?: string;
-};
-
-type TeamDetailPayload = {
-  info?: TeamInfo;
-  upcoming_matches?: TeamMatch[];
-  completed_matches?: TeamMatch[];
-};
-
-function asTeamDetail(data: Record<string, unknown> | null): TeamDetailPayload {
-  if (!data) return {};
-  return {
-    info: (data.info as TeamInfo) || {},
-    upcoming_matches: (data.upcoming_matches as TeamMatch[]) || [],
-    completed_matches: (data.completed_matches as TeamMatch[]) || [],
-  };
-}
 
 function formatSeries(series?: string) {
   if (!series) return "BO ?";
@@ -241,6 +221,51 @@ function teamLogoUri(team?: { logo?: string | null; logo_url?: string | null; im
   return text;
 }
 
+function toTeamMatchFromVct(m: HomeVctMatchItem): TeamMatch {
+  return {
+    match_id: m.match_id,
+    phase: m.phase,
+    series: m.best_of || undefined,
+    match_datetime: m.match_datetime,
+    team1: {
+      id: m.team1?.id,
+      name: m.team1?.name,
+      tag: m.team1?.tag ?? null,
+      score: m.team1?.score ?? null,
+      logo: teamLogoUri(m.team1),
+    },
+    team2: {
+      id: m.team2?.id,
+      name: m.team2?.name,
+      tag: m.team2?.tag ?? null,
+      score: m.team2?.score ?? null,
+      logo: teamLogoUri(m.team2),
+    },
+  };
+}
+
+function filterVctMatchesForTeam(
+  items: HomeVctMatchItem[],
+  teamId: number,
+  meta?: Pick<TeamSelectorTeam, "name" | "tag"> | null
+) {
+  return items.filter((m) => {
+    if (m.team1?.id === teamId || m.team2?.id === teamId) return true;
+    if (!meta?.name && !meta?.tag) return false;
+    const aliases = [
+      normalizeNameKey(m.team1?.name),
+      normalizeNameKey(m.team1?.tag || undefined),
+      normalizeNameKey(m.team2?.name),
+      normalizeNameKey(m.team2?.tag || undefined),
+    ].filter(Boolean);
+    const nk = normalizeNameKey(meta.name);
+    const tk = normalizeNameKey(meta.tag || undefined);
+    if (nk && aliases.includes(nk)) return true;
+    if (tk && aliases.includes(tk)) return true;
+    return false;
+  });
+}
+
 function LogoSquare({
   uri,
   size = 32,
@@ -302,6 +327,7 @@ export function HomeScreen() {
   const [selectedRegion, setSelectedRegion] = useState<string>("");
   const [storageReady, setStorageReady] = useState(false);
   const hasFocused = useRef(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   useEffect(() => {
     async function init() {
@@ -324,20 +350,19 @@ export function HomeScreen() {
     init();
   }, []);
 
-  const selectorHook = useAsyncData(
-    () => getTeamSelector(1),
+  const selectorHook = usePersistedAsyncData(PERSIST_KEYS.homeTeamSelector, () => getTeamSelector(1), []);
+  const liveHook = usePersistedAsyncData(PERSIST_KEYS.homeLiveMatches, () => getLiveMatches(30), []);
+  /** 主队赛程与「下一场」均从该列表筛选，避免再请求较慢的 /team/:id 详情。 */
+  const upcomingVctHook = usePersistedAsyncData(
+    PERSIST_KEYS.homeVctUpcoming,
+    () => getHomeVctMatches("upcoming", 150, 2),
     []
   );
-  const teamHook = useAsyncData(
-    async () => {
-      if (!selectedTeamId) return null;
-      return getTeamDetail(selectedTeamId);
-    },
-    [selectedTeamId]
+  const completedVctHook = usePersistedAsyncData(
+    PERSIST_KEYS.homeVctCompleted,
+    () => getHomeVctMatches("completed", 40, 2),
+    []
   );
-  const liveHook = useAsyncData(() => getLiveMatches(30), []);
-  const upcomingVctHook = useAsyncData(() => getHomeVctMatches("upcoming", 5, 1), []);
-  const completedVctHook = useAsyncData(() => getHomeVctMatches("completed", 5, 1), []);
 
   useEffect(() => {
     const regions = selectorHook.data?.items || [];
@@ -348,31 +373,47 @@ export function HomeScreen() {
     }
   }, [selectorHook.data, selectedRegion]);
 
-  const detail = asTeamDetail(teamHook.data);
-  const info = detail.info || {};
-  const upcoming = detail.upcoming_matches || [];
   const activeVctHook = tab === "upcoming" ? upcomingVctHook : completedVctHook;
   const vctMatches = (activeVctHook.data?.items || []) as HomeVctMatchItem[];
-  const teamTag = (info as { tag?: string | null }).tag;
-  const nextMatch = useMemo(() => pickNextUpcomingMatch(upcoming), [upcoming]);
+
+  const selectedTeamMeta = useMemo((): TeamSelectorTeam | null => {
+    if (!selectedTeamId || !selectorHook.data?.items?.length) return null;
+    const regions = selectorHook.data.items as TeamSelectorRegion[];
+    for (const r of regions) {
+      const hit = r.teams?.find((t) => t.team_id === selectedTeamId);
+      if (hit) return hit;
+    }
+    return null;
+  }, [selectorHook.data, selectedTeamId]);
+
+  const nextMatch = useMemo(() => {
+    if (!selectedTeamId || !upcomingVctHook.data?.items?.length) return undefined;
+    const items = upcomingVctHook.data.items as HomeVctMatchItem[];
+    const filtered = filterVctMatchesForTeam(items, selectedTeamId, selectedTeamMeta);
+    const teamMatches = filtered.map(toTeamMatchFromVct);
+    return pickNextUpcomingMatch(teamMatches);
+  }, [selectedTeamId, upcomingVctHook.data, selectedTeamMeta]);
+
   const liveMatch = useMemo(
     () =>
       findLiveMatchForTeam(
         (liveHook.data?.items || []) as MatchListItem[],
         selectedTeamId,
-        info.name,
-        teamTag
+        selectedTeamMeta?.name,
+        selectedTeamMeta?.tag ?? null
       ),
-    [liveHook.data, selectedTeamId, info.name, teamTag]
+    [liveHook.data, selectedTeamId, selectedTeamMeta]
   );
   const featuredMatch = liveMatch || nextMatch;
-  const opponent = pickOpponentTeam(featuredMatch, (info.team_id as number | undefined));
+  const opponent = pickOpponentTeam(featuredMatch, selectedTeamId ?? undefined);
   const featuredIsLive = !!liveMatch;
   const list = vctMatches;
-  const loadedTeamId = Number((info.team_id as number | undefined) || 0);
-  const isSwitchingTeam =
-    !!selectedTeamId &&
-    (teamHook.loading || (loadedTeamId > 0 && loadedTeamId !== selectedTeamId));
+  const ourTeamFromMatch = useMemo(() => {
+    if (!selectedTeamId || !featuredMatch) return undefined;
+    if (featuredMatch.team1?.id === selectedTeamId) return featuredMatch.team1;
+    if (featuredMatch.team2?.id === selectedTeamId) return featuredMatch.team2;
+    return undefined;
+  }, [featuredMatch, selectedTeamId]);
 
   const regionOptions = (selectorHook.data?.items || []) as TeamSelectorRegion[];
   const selectedRegionTeams = useMemo(() => {
@@ -388,9 +429,24 @@ export function HomeScreen() {
         return;
       }
       liveHook.reload();
-      if (selectedTeamId) teamHook.reload();
-    }, [liveHook.reload, selectedTeamId, teamHook.reload])
+      upcomingVctHook.reload();
+      completedVctHook.reload();
+    }, [liveHook.reload, upcomingVctHook.reload, completedVctHook.reload])
   );
+
+  async function onRefresh() {
+    setRefreshing(true);
+    try {
+      await Promise.all([
+        selectorHook.reload(),
+        liveHook.reload(),
+        upcomingVctHook.reload(),
+        completedVctHook.reload(),
+      ]);
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   async function onSelectTeam(teamId: number) {
     setSelectedTeamId(teamId);
@@ -399,13 +455,20 @@ export function HomeScreen() {
   }
 
   if (!storageReady) return <LoadingState />;
-  if (selectedTeamId && teamHook.loading && !teamHook.data) return <LoadingState />;
-  if (teamHook.error) return <ErrorState message={teamHook.error} onRetry={teamHook.reload} />;
-  if (activeVctHook.error) return <ErrorState message={activeVctHook.error} onRetry={activeVctHook.reload} />;
+  if (selectorHook.loading && !selectorHook.data) return <LoadingState />;
+  if (selectorHook.error) {
+    return <ErrorState message={selectorHook.error} onRetry={selectorHook.reload} />;
+  }
+  if (activeVctHook.error) {
+    return <ErrorState message={activeVctHook.error} onRetry={activeVctHook.reload} />;
+  }
 
   return (
     <View style={styles.safe}>
-      <ScrollView contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 18 }]}>
+      <ScrollView
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
+        contentContainerStyle={[styles.scroll, { paddingTop: insets.top + 18 }]}
+      >
         <View style={styles.headerRow}>
           <View style={styles.headerIconWrap}>
             <LogoSquare uri={HOME_IMAGE_URLS.topAvatar} size={38} borderRadius={10} />
@@ -419,49 +482,51 @@ export function HomeScreen() {
         <Pressable
           style={styles.heroCard}
           onPress={() => {
-            if (!isSwitchingTeam && featuredMatch?.match_id) {
+            if (featuredMatch?.match_id) {
               navigation.navigate("MatchDetail", { matchId: featuredMatch.match_id });
             }
           }}
         >
-          {isSwitchingTeam ? (
-            <View style={styles.heroLoadingWrap}>
-              <ActivityIndicator size="small" color="#111827" />
-              <Text style={styles.heroLoadingText}>加载主队赛程...</Text>
-            </View>
-          ) : (
-            <>
-              <Text style={styles.heroBo}>{featuredMatch ? inferBestOfForTeamMatch(featuredMatch) : "BO -"}</Text>
-              <View style={styles.heroTeams}>
-                <View style={styles.heroTeamItem}>
-                  <LogoSquare uri={info.logo_url || HOME_IMAGE_URLS.defaultLogo} />
-                  <Text style={styles.heroTeamName}>
-                    {selectedTeamId
-                      ? getTeamAbbr(info.name, (info as { tag?: string | null }).tag)
-                      : "请先选择主队"}
-                  </Text>
-                </View>
-                <View style={styles.heroTeamItem}>
-                  <LogoSquare uri={teamLogoUri(opponent) || HOME_IMAGE_URLS.defaultLogo} />
-                  <Text style={styles.heroTeamName}>
-                    {selectedTeamId ? getTeamAbbr(opponent?.name, opponent?.tag) : "-"}
-                  </Text>
-                </View>
+          <>
+            <Text style={styles.heroBo}>{featuredMatch ? inferBestOfForTeamMatch(featuredMatch) : "BO -"}</Text>
+            <View style={styles.heroTeams}>
+              <View style={styles.heroTeamItem}>
+                <LogoSquare
+                  uri={
+                    selectedTeamMeta?.logo_url ||
+                    teamLogoUri(ourTeamFromMatch) ||
+                    HOME_IMAGE_URLS.defaultLogo
+                  }
+                />
+                <Text style={styles.heroTeamName}>
+                  {selectedTeamId
+                    ? getTeamAbbr(
+                        selectedTeamMeta?.name || ourTeamFromMatch?.name,
+                        selectedTeamMeta?.tag ?? ourTeamFromMatch?.tag ?? null
+                      )
+                    : "请先选择主队"}
+                </Text>
               </View>
-              <Text style={styles.heroTime}>
-                {selectedTeamId && featuredMatch
-                  ? featuredIsLive
-                    ? (() => {
-                        const liveScore = scoreText(featuredMatch);
-                        return liveScore === "-" ? "LIVE | 比赛进行中" : `LIVE | ${liveScore}`;
-                      })()
-                    : `${formatCountdown(featuredMatch.match_datetime)} | ${formatDateTime(featuredMatch.match_datetime)}`
-                  : selectedTeamId
-                    ? "暂无下一场比赛"
-                    : "请选择主队后查看赛程"}
-              </Text>
-            </>
-          )}
+              <View style={styles.heroTeamItem}>
+                <LogoSquare uri={teamLogoUri(opponent) || HOME_IMAGE_URLS.defaultLogo} />
+                <Text style={styles.heroTeamName}>
+                  {selectedTeamId ? getTeamAbbr(opponent?.name, opponent?.tag) : "-"}
+                </Text>
+              </View>
+            </View>
+            <Text style={styles.heroTime}>
+              {selectedTeamId && featuredMatch
+                ? featuredIsLive
+                  ? (() => {
+                      const liveScore = scoreText(featuredMatch);
+                      return liveScore === "-" ? "LIVE | 比赛进行中" : `LIVE | ${liveScore}`;
+                    })()
+                  : `${formatCountdown(featuredMatch.match_datetime)} | ${formatDateTime(featuredMatch.match_datetime)}`
+                : selectedTeamId
+                  ? "暂无下一场比赛"
+                  : "请选择主队后查看赛程"}
+            </Text>
+          </>
         </Pressable>
 
         <View style={styles.matchHeader}>

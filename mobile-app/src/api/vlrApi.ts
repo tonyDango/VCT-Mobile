@@ -12,6 +12,7 @@ import {
   SearchResultsResponse,
   TeamSelectorRegion,
   TeamDirectoryItem,
+  TeamRosterMember,
 } from "./types";
 
 export async function getUpcomingMatches(limit = 30) {
@@ -76,6 +77,10 @@ export async function getTeams(
 
 export async function getTeamDetail(teamId: number) {
   return apiGet<Record<string, unknown>>(`/team/${teamId}`);
+}
+
+export async function getTeamRoster(teamId: number) {
+  return apiGet<{ items: TeamRosterMember[] }>(`/team/${teamId}/roster`);
 }
 
 export async function getHomeVctMatches(

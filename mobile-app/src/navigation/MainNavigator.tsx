@@ -8,6 +8,7 @@ import { EventsScreen } from "../screens/EventsScreen";
 import { HomeScreen } from "../screens/HomeScreen";
 import { MatchDetailScreen } from "../screens/MatchDetailScreen";
 import { MatchesScreen } from "../screens/MatchesScreen";
+import { BootstrapScreen } from "../screens/BootstrapScreen";
 import { PlayerDetailScreen } from "../screens/PlayerDetailScreen";
 import { PlayersScreen } from "../screens/PlayersScreen";
 import { SearchScreen } from "../screens/SearchScreen";
@@ -64,6 +65,7 @@ export default function MainNavigator() {
   return (
     <NavigationContainer>
       <Stack.Navigator>
+        <Stack.Screen name="Bootstrap" component={BootstrapScreen} options={{ headerShown: false }} />
         <Stack.Screen name="MainTabs" component={MainTabs} options={{ headerShown: false }} />
         <Stack.Screen name="Search" component={SearchScreen} options={{ title: "搜索" }} />
         <Stack.Screen name="MatchDetail" component={MatchDetailScreen} options={{ title: "比赛详情" }} />

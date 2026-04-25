@@ -6,7 +6,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { EventMatchItem, MatchDetailResponse, MatchDetailTeam, MatchMapTeamScore, MatchTeam } from "../api/types";
 import { getEventDetail, getEventMatches, getMatchDetail } from "../api/vlrApi";
-import { HOME_IMAGE_URLS, HOME_REGION_ICON_URLS } from "../config/homeConfig";
+import { eventEmojiForMeta, eventIconUriForMeta, metaFromDetailInfo } from "../config/eventDisplay";
+import { HOME_IMAGE_URLS } from "../config/homeConfig";
 import { useAsyncData } from "../hooks/useAsyncData";
 import { RootStackParamList } from "../navigation/types";
 
@@ -58,6 +59,8 @@ export function EventDetailScreen() {
   const detailHook = useAsyncData(() => getEventDetail(eventId), [eventId]);
   const matchesHook = useAsyncData(() => getEventMatches(eventId), [eventId]);
 
+  const eventInfo = ((detailHook.data?.info as EventInfoLite | undefined) || {}) as EventInfoLite;
+
   const allMatches = (matchesHook.data?.items || []) as EventMatchItem[];
   const stageMode = useMemo(() => detectStageMode(allMatches), [allMatches]);
   const stageOptions = useMemo(() => stageOptionsForMode(stageMode), [stageMode]);
@@ -73,9 +76,10 @@ export function EventDetailScreen() {
 
   const stageMatches = useMemo(() => filterMatchesByTab(allMatches, stageTab), [allMatches, stageTab]);
   const subGroupEnabled = stageTab === "group";
+  const championsMode = useMemo(() => isChampionsEvent(eventInfo), [eventInfo]);
   const subGroupPlan = useMemo(
-    () => (subGroupEnabled ? buildSubGroupPlan(stageMatches) : EMPTY_SUB_GROUP_PLAN),
-    [stageMatches, subGroupEnabled]
+    () => (subGroupEnabled ? buildSubGroupPlan(stageMatches, championsMode) : EMPTY_SUB_GROUP_PLAN),
+    [stageMatches, subGroupEnabled, championsMode]
   );
   const subGroups = subGroupPlan.tokens;
 
@@ -132,9 +136,9 @@ export function EventDetailScreen() {
     return buildTeamStandings(activeStageMatches, detailCacheRef.current);
   }, [eventId, standingsEnabled, standingsKey]);
 
-  const eventInfo = ((detailHook.data?.info as EventInfoLite | undefined) || {}) as EventInfoLite;
-  const topIconUri = eventIconUri(eventInfo);
-  const regionEmoji = eventRegionEmoji(eventInfo);
+  const eventDisplayMeta = useMemo(() => metaFromDetailInfo(eventInfo), [eventInfo]);
+  const topIconUri = eventIconUriForMeta(eventDisplayMeta);
+  const regionEmoji = eventEmojiForMeta(eventDisplayMeta);
   const dateText = eventDateText(eventInfo);
 
   return (
@@ -416,12 +420,67 @@ function stageSource(match: EventMatchItem) {
   return `${match.stage || ""} ${match.phase || ""}`.toLowerCase();
 }
 
-function buildSubGroupPlan(matches: EventMatchItem[]): SubGroupPlan {
+function isChampionsEvent(info: EventInfoLite): boolean {
+  const n = (info.name || "").toLowerCase();
+  if (n.includes("challengers")) return false;
+  if (n.includes("champions") || n.includes("champs")) return true;
+  const regions = (info.regions || []).map((r) => String(r).toLowerCase());
+  if (regions.some((r) => r.includes("champions") || r.includes("champs"))) return true;
+  return false;
+}
+
+/** 冠军赛小组无文案时：若图论上恰为 4 个互不连通的池，则标为 A/B/C/D 四组。 */
+function tryChampionsFourGroupSplit(
+  teams: string[],
+  edges: Array<{ matchId: number; a: string; b: string }>,
+  byTeamKey: Record<string, string>,
+  byMatchId: Record<number, string>
+): SubGroupPlan | null {
+  if (teams.length < 8) return null;
+  const parent: Record<string, string> = {};
+  for (const key of teams) parent[key] = key;
+  function find(x: string): string {
+    if (!parent[x]) parent[x] = x;
+    if (parent[x] !== x) parent[x] = find(parent[x]);
+    return parent[x];
+  }
+  function union(a: string, b: string) {
+    const pa = find(a);
+    const pb = find(b);
+    if (pa !== pb) parent[pb] = pa;
+  }
+  for (const edge of edges) union(edge.a, edge.b);
+  const componentMembers = new Map<string, Set<string>>();
+  for (const key of teams) {
+    const root = find(key);
+    if (!componentMembers.has(root)) componentMembers.set(root, new Set<string>());
+    componentMembers.get(root)?.add(key);
+  }
+  const components = [...componentMembers.values()];
+  if (components.length !== 4) return null;
+
+  const letters = ["A", "B", "C", "D"];
+  const sorted = components
+    .map((set) => ({ set, minKey: [...set].sort()[0] || "" }))
+    .sort((a, b) => a.minKey.localeCompare(b.minKey));
+  sorted.forEach((row, idx) => {
+    const label = letters[idx] || `G${idx}`;
+    for (const teamKey of row.set) byTeamKey[teamKey] = label;
+  });
+  for (const edge of edges) {
+    const ta = byTeamKey[edge.a];
+    const tb = byTeamKey[edge.b];
+    if (ta && tb && ta === tb) byMatchId[edge.matchId] = ta;
+  }
+  return { tokens: [...letters], byMatchId, byTeamKey };
+}
+
+function buildSubGroupPlan(matches: EventMatchItem[], championsMode: boolean): SubGroupPlan {
   const byMatchId: Record<number, string> = {};
   const byTeamKey: Record<string, string> = {};
   const explicit = new Set<string>();
   for (const match of matches) {
-    const token = extractSubGroupToken(match);
+    const token = extractSubGroupToken(match, championsMode);
     if (!token) continue;
     byMatchId[match.match_id] = token;
     explicit.add(token);
@@ -448,8 +507,14 @@ function buildSubGroupPlan(matches: EventMatchItem[]): SubGroupPlan {
 
   // fallback A: 无显式组名时，按“组内对局最大化”做二分（强制 6/6 等分）
   const teams = [...teamSet];
+
+  if (championsMode) {
+    const four = tryChampionsFourGroupSplit(teams, edges, byTeamKey, byMatchId);
+    if (four) return four;
+  }
+
   const hasEvenGroups = teams.length >= 6 && teams.length % 2 === 0 && teams.length <= 14;
-  if (hasEvenGroups) {
+  if (hasEvenGroups && !championsMode) {
     const split = bestBalancedSplit(teams, edges);
     for (const teamKey of split.alpha) byTeamKey[teamKey] = "alpha";
     for (const teamKey of split.omega) byTeamKey[teamKey] = "omega";
@@ -462,39 +527,41 @@ function buildSubGroupPlan(matches: EventMatchItem[]): SubGroupPlan {
     return { tokens: ["alpha", "omega"], byMatchId, byTeamKey };
   }
 
-  // fallback B: 再退化为连通分量（旧策略）
-  const parent: Record<string, string> = {};
-  for (const key of teams) parent[key] = key;
-  function find(x: string): string {
-    if (!parent[x]) parent[x] = x;
-    if (parent[x] !== x) parent[x] = find(parent[x]);
-    return parent[x];
-  }
-  function union(a: string, b: string) {
-    const pa = find(a);
-    const pb = find(b);
-    if (pa !== pb) parent[pb] = pa;
-  }
-  for (const edge of edges) union(edge.a, edge.b);
-  const componentMembers = new Map<string, Set<string>>();
-  for (const key of teams) {
-    const root = find(key);
-    if (!componentMembers.has(root)) componentMembers.set(root, new Set<string>());
-    componentMembers.get(root)?.add(key);
-  }
-  const components = [...componentMembers.entries()].sort((a, b) => b[1].size - a[1].size);
-  if (components.length >= 2) {
-    const alphaRoot = components[0][0];
-    const omegaRoot = components[1][0];
-    for (const [teamKey] of Object.entries(parent)) {
-      const root = find(teamKey);
-      if (root === alphaRoot) byTeamKey[teamKey] = "alpha";
-      if (root === omegaRoot) byTeamKey[teamKey] = "omega";
+  // fallback B: 再退化为连通分量（旧策略，联赛 α/Ω；冠军赛不在此做二分）
+  if (!championsMode) {
+    const parent: Record<string, string> = {};
+    for (const key of teams) parent[key] = key;
+    function find(x: string): string {
+      if (!parent[x]) parent[x] = x;
+      if (parent[x] !== x) parent[x] = find(parent[x]);
+      return parent[x];
     }
-    for (const edge of edges) {
-      const ta = byTeamKey[edge.a];
-      const tb = byTeamKey[edge.b];
-      if (ta && tb && ta === tb) byMatchId[edge.matchId] = ta;
+    function union(a: string, b: string) {
+      const pa = find(a);
+      const pb = find(b);
+      if (pa !== pb) parent[pb] = pa;
+    }
+    for (const edge of edges) union(edge.a, edge.b);
+    const componentMembers = new Map<string, Set<string>>();
+    for (const key of teams) {
+      const root = find(key);
+      if (!componentMembers.has(root)) componentMembers.set(root, new Set<string>());
+      componentMembers.get(root)?.add(key);
+    }
+    const components = [...componentMembers.entries()].sort((a, b) => b[1].size - a[1].size);
+    if (components.length >= 2) {
+      const alphaRoot = components[0][0];
+      const omegaRoot = components[1][0];
+      for (const [teamKey] of Object.entries(parent)) {
+        const root = find(teamKey);
+        if (root === alphaRoot) byTeamKey[teamKey] = "alpha";
+        if (root === omegaRoot) byTeamKey[teamKey] = "omega";
+      }
+      for (const edge of edges) {
+        const ta = byTeamKey[edge.a];
+        const tb = byTeamKey[edge.b];
+        if (ta && tb && ta === tb) byMatchId[edge.matchId] = ta;
+      }
     }
   }
   const tokens = [...new Set(Object.values(byTeamKey))].sort(
@@ -556,27 +623,55 @@ function bitCount(n: number) {
 
 function subGroupSortWeight(token: string) {
   const t = token.toLowerCase();
-  if (t === "alpha") return 1;
-  if (t === "omega") return 2;
-  return 10;
+  if (t === "a") return 1;
+  if (t === "b") return 2;
+  if (t === "c") return 3;
+  if (t === "d") return 4;
+  if (t === "alpha") return 10;
+  if (t === "omega") return 11;
+  return 50;
 }
 
-function extractSubGroupToken(match: EventMatchItem): string | null {
-  const src = `${match.stage || ""} ${match.phase || ""}`;
-  if (/alpha/i.test(src)) return "alpha";
-  if (/omega/i.test(src)) return "omega";
-  const bracket = src.match(/\(([A-Za-z0-9]+)\)/);
-  if (bracket?.[1]) return normalizeSubGroupToken(bracket[1]);
-  const suffix = src.match(/\bgroup\s+([A-Za-z0-9]+)\b/i);
+function extractSubGroupToken(match: EventMatchItem, championsMode: boolean): string | null {
+  const raw = `${match.stage || ""} ${match.phase || ""}`;
+  const src = raw.toLowerCase();
+
+  if (championsMode) {
+    let m = raw.match(/\bgroup\s*([ABCD])\b/i);
+    if (m?.[1]) return m[1].toUpperCase();
+    m = raw.match(/\b([ABCD])\s*组\b/);
+    if (m?.[1]) return m[1].toUpperCase();
+    m = raw.match(/\(([ABCD])\)/i);
+    if (m?.[1]) return m[1].toUpperCase();
+    m = raw.match(/\b([ABCD])\b(?=\s*(?:vs|v\.?)\s)/i);
+    if (m?.[1]) return m[1].toUpperCase();
+  } else {
+    if (/alpha/i.test(raw)) return "alpha";
+    if (/omega/i.test(raw)) return "omega";
+  }
+
+  const bracket = raw.match(/\(([A-Za-z0-9]+)\)/);
+  if (bracket?.[1]) return normalizeSubGroupToken(bracket[1], championsMode);
+  const suffix = raw.match(/\bgroup\s+([A-Za-z0-9]+)\b/i);
   if (suffix?.[1] && suffix[1].toLowerCase() !== "stage") {
-    return normalizeSubGroupToken(suffix[1]);
+    return normalizeSubGroupToken(suffix[1], championsMode);
+  }
+  if (!championsMode) {
+    if (/alpha/i.test(src)) return "alpha";
+    if (/omega/i.test(src)) return "omega";
   }
   return null;
 }
 
-function normalizeSubGroupToken(raw: string) {
+function normalizeSubGroupToken(raw: string, championsMode: boolean) {
   const token = (raw || "").trim().toLowerCase();
   if (!token) return null;
+  if (championsMode) {
+    if (/^[abcd]$/.test(token)) return token.toUpperCase();
+    if (token === "alpha") return "ALPHA";
+    if (token === "omega") return "OMEGA";
+    return token.replace(/\s+/g, "").toUpperCase();
+  }
   if (token === "alpha" || token === "a" || token === "b") return "alpha";
   if (token === "omega" || token === "c" || token === "d") return "omega";
   return token.toUpperCase();
@@ -586,6 +681,7 @@ function subGroupLabel(token: string) {
   const t = token.toLowerCase();
   if (t === "alpha") return "α";
   if (t === "omega") return "Ω";
+  if (t === "a" || t === "b" || t === "c" || t === "d") return `${t.toUpperCase()}组`;
   return token;
 }
 
@@ -784,51 +880,6 @@ function teamNodeKey(team?: MatchTeam) {
   if (typeof team.id === "number") return `id:${team.id}`;
   const name = (team.name || "").trim().toLowerCase();
   return name ? `name:${name}` : "";
-}
-
-function eventIconUri(info: EventInfoLite) {
-  const detected = detectEventDetailRegion(info);
-  if (!detected) return HOME_IMAGE_URLS.regionDefaultIcon;
-  if (detected === "emea") {
-    return HOME_REGION_ICON_URLS.EMEA || HOME_REGION_ICON_URLS.emea || HOME_IMAGE_URLS.regionDefaultIcon;
-  }
-  if (detected === "champions") {
-    return (
-      HOME_REGION_ICON_URLS.Champs ||
-      HOME_REGION_ICON_URLS.Champions ||
-      HOME_REGION_ICON_URLS.champs ||
-      HOME_REGION_ICON_URLS.champions ||
-      HOME_IMAGE_URLS.regionDefaultIcon
-    );
-  }
-  const key = detected.charAt(0).toUpperCase() + detected.slice(1);
-  return HOME_REGION_ICON_URLS[key] || HOME_REGION_ICON_URLS[detected] || HOME_IMAGE_URLS.regionDefaultIcon;
-}
-
-function eventRegionEmoji(info: EventInfoLite) {
-  const detected = detectEventDetailRegion(info);
-  if (detected === "china") return "🇨🇳";
-  if (detected === "americas") return "🌎";
-  if (detected === "emea") return "🌍";
-  if (detected === "pacific") return "🌏";
-  if (detected === "masters" || detected === "champions") return "🏆";
-  return "🗺️";
-}
-
-function detectEventDetailRegion(info: EventInfoLite): string {
-  const byName = `${info.name || ""}`.toLowerCase();
-  // Masters/Champions 需优先于赛区标签，否则会被 Americas/EMEA 抢匹配
-  if (byName.includes("champions") || byName.includes("champs")) return "champions";
-  if (byName.includes("masters")) return "masters";
-
-  const regions = (info.regions || []).map((r) => String(r).toLowerCase());
-  if (regions.some((r) => r.includes("china"))) return "china";
-  if (regions.some((r) => r.includes("emea"))) return "emea";
-  if (regions.some((r) => r.includes("pacific"))) return "pacific";
-  if (regions.some((r) => r.includes("americas"))) return "americas";
-  if (regions.some((r) => r.includes("champions") || r.includes("champs"))) return "champions";
-  if (regions.some((r) => r.includes("masters"))) return "masters";
-  return "";
 }
 
 function eventDateText(info: EventInfoLite) {

@@ -3,7 +3,7 @@ export const HOME_SELECTED_TEAM_STORAGE_KEY = "home:selected_team_id";
 
 // 在这里替换为你自己的图片 URL（队标、头像、图标）。
 export const HOME_IMAGE_URLS = {
-  topAvatar: "https://user9123.cn.imgto.link/public/20260423/1.avif",
+  topAvatar: "https://user9123.cn.imgto.link/public/20260425/a91klrgx9-1fibbgv-19xo.avif",
   defaultLogo: "https://via.placeholder.com/64",
   searchIcon: "https://user9123.cn.imgto.link/public/20260422/segment.avif",
   navHomeIcon: "https://user9123.cn.imgto.link/public/20260422/home.avif",
@@ -24,5 +24,8 @@ export const HOME_REGION_ICON_URLS: Record<string, string> = {
   Champions: "https://user9123.cn.imgto.link/public/20260422/692fc60a022bb.avif",
 };
 
-// 队名简称映射（可按需补充）
-export const HOME_TEAM_ABBR_MAP: Record<string, string> = {};
+// 队名简称映射（可按需补充；用于 VLR 简称与常见写法不一致时）
+export const HOME_TEAM_ABBR_MAP: Record<string, string> = {
+  mibr: "MIBR",
+  "made in brazil": "MIBR",
+};

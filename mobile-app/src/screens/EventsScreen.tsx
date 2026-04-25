@@ -19,8 +19,10 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { EventListItem } from "../api/types";
 import { getEvents } from "../api/vlrApi";
+import { detectEventRegionKind, eventEmojiForMeta, eventIconUriForMeta, metaFromListItem } from "../config/eventDisplay";
 import { HOME_IMAGE_URLS, HOME_REGION_ICON_URLS } from "../config/homeConfig";
-import { useAsyncData } from "../hooks/useAsyncData";
+import { usePersistedAsyncData } from "../hooks/usePersistedAsyncData";
+import { PERSIST_KEYS } from "../bootstrap/preload";
 import { MainTabParamList, RootStackParamList } from "../navigation/types";
 
 type EventTab = "upcoming" | "completed";
@@ -65,9 +67,17 @@ export function EventsScreen() {
   );
   const dropdownTop = Math.max(insets.top + 8, filterAnchor.y);
 
-  const ongoingHook = useAsyncData(() => getEvents("ongoing", 60), []);
-  const upcomingHook = useAsyncData(() => getEvents("upcoming", EVENTS_FETCH_LIMIT), []);
-  const completedHook = useAsyncData(() => getEvents("completed", EVENTS_FETCH_LIMIT), []);
+  const ongoingHook = usePersistedAsyncData(PERSIST_KEYS.eventsOngoing, () => getEvents("ongoing", 60), []);
+  const upcomingHook = usePersistedAsyncData(
+    PERSIST_KEYS.eventsUpcoming,
+    () => getEvents("upcoming", EVENTS_FETCH_LIMIT),
+    []
+  );
+  const completedHook = usePersistedAsyncData(
+    PERSIST_KEYS.eventsCompleted,
+    () => getEvents("completed", EVENTS_FETCH_LIMIT),
+    []
+  );
 
   const activeHook = tab === "upcoming" ? upcomingHook : completedHook;
   const filteredOngoing = useMemo(() => {
@@ -119,7 +129,8 @@ export function EventsScreen() {
     try {
       setUpcomingPage(1);
       setCompletedPage(1);
-      await Promise.all([ongoingHook.reload(), upcomingHook.reload(), completedHook.reload()]);
+      // 仅刷新 ongoing 的赛事，upcoming/completed 保持不变
+      await ongoingHook.reload();
     } finally {
       setRefreshing(false);
     }
@@ -284,7 +295,8 @@ export function EventsScreen() {
 }
 
 function EventRow({ item, alt, onPress }: { item: EventListItem; alt?: boolean; onPress?: () => void }) {
-  const iconUri = eventIconUri(item);
+  const meta = metaFromListItem(item);
+  const iconUri = eventIconUriForMeta(meta);
   return (
     <Pressable onPress={onPress} style={[styles.matchRow, alt && styles.matchRowAlt]}>
       {iconUri ? (
@@ -298,7 +310,7 @@ function EventRow({ item, alt, onPress }: { item: EventListItem; alt?: boolean; 
         </Text>
         <Text style={styles.eventDate}>{formatDateRange(item.start_date, item.end_date)}</Text>
       </View>
-      <Text style={styles.eventRegion}>{eventEmoji(item)}</Text>
+      <Text style={styles.eventRegion}>{eventEmojiForMeta(meta)}</Text>
     </Pressable>
   );
 }
@@ -405,59 +417,10 @@ function regionIconFor(regionName: string) {
   return HOME_REGION_ICON_URLS[key] || HOME_REGION_ICON_URLS[v] || HOME_IMAGE_URLS.regionDefaultIcon;
 }
 
-function detectEventRegion(event: EventListItem): RegionValue | "" {
-  const src = `${event.region || ""} ${event.name || ""}`.toLowerCase();
-  if (src.includes("americas")) return "americas";
-  if (src.includes("emea")) return "emea";
-  if (src.includes("pacific")) return "pacific";
-  if (src.includes("china")) return "china";
-  if (src.includes("masters")) return "masters";
-  if (src.includes("champions") || src.includes("champs")) return "champions";
-  return "";
-}
-
 function matchesRegion(event: EventListItem, selectedRegions: RegionValue[]) {
   if (selectedRegions.length === 0) return false;
-  const region = detectEventRegion(event);
-  return region ? selectedRegions.includes(region) : false;
-}
-
-function eventIconUri(event: EventListItem) {
-  const detected = detectEventRegion(event);
-  if (detected) return regionIconFor(detected);
-  return regionIconFor(event.region || "");
-}
-
-function eventEmoji(event: EventListItem) {
-  const src = `${event.region || ""} ${event.name || ""}`.toLowerCase();
-  const map: Array<[string, string]> = [
-    ["south korea", "🇰🇷"],
-    ["korea", "🇰🇷"],
-    ["japan", "🇯🇵"],
-    ["china", "🇨🇳"],
-    ["thailand", "🇹🇭"],
-    ["singapore", "🇸🇬"],
-    ["indonesia", "🇮🇩"],
-    ["philippines", "🇵🇭"],
-    ["united states", "🇺🇸"],
-    ["usa", "🇺🇸"],
-    ["canada", "🇨🇦"],
-    ["brazil", "🇧🇷"],
-    ["france", "🇫🇷"],
-    ["germany", "🇩🇪"],
-    ["spain", "🇪🇸"],
-    ["turkey", "🇹🇷"],
-    ["uk", "🇬🇧"],
-    ["united kingdom", "🇬🇧"],
-  ];
-  for (const [k, emoji] of map) {
-    if (src.includes(k)) return emoji;
-  }
-  if (src.includes("americas")) return "🌎";
-  if (src.includes("emea")) return "🌍";
-  if (src.includes("pacific")) return "🌏";
-  if (src.includes("masters") || src.includes("champions") || src.includes("champs")) return "🗺️";
-  return "🗺️";
+  const region = detectEventRegionKind(metaFromListItem(event));
+  return region ? selectedRegions.includes(region as RegionValue) : false;
 }
 
 const styles = StyleSheet.create({
